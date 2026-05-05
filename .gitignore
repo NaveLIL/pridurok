@@ -1,0 +1,16 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+logs/
+*.log
+.vscode/
+.idea/
+history.json
+user_data.json
+last_ping.txt
+*.lnk
+*.zip
+memory_db/
+dialog_logs/
