@@ -1,110 +1,123 @@
-"""История диалогов: на каждого пользователя свой контекст. Сохраняется на диск.
-Поддерживает суммаризацию — старые сообщения сжимаются в одну summary-строку.
+"""
+История диалогов: умный менеджер контекста с сохранением на диск, 
+лимитом по объему текста и очисткой неактивных пользователей.
 """
 import json
-from collections import defaultdict, deque
-from pathlib import Path
-from threading import Lock
-from typing import Deque
+import os
+import time
+from collections import deque
+from typing import List, Dict, Any
 
 import config
 
-_FILE = Path(__file__).parent / "history.json"
-_lock = Lock()
+# Настройки (желательно добавить их в config.py, но если их нет, используются дефолтные)
+HISTORY_LIMIT = getattr(config, 'HISTORY_LIMIT', 15)           # Макс. количество сообщений
+MAX_CHARS = getattr(config, 'MAX_HISTORY_CHARS', 4000)         # Макс. объем текста в истории (~1000 токенов)
+TTL_SECONDS = getattr(config, 'HISTORY_TTL', 86400)            # Сколько помнить юзера (86400 сек = 24 часа)
+HISTORY_FILE = getattr(config, 'HISTORY_FILE', 'history.json') # Файл для сохранения памяти
+
+# Структура: user_id -> {"last_active": timestamp, "messages": deque}
+_history: Dict[int, Dict[str, Any]] = {}
 
 
-def _make_deque(items=None) -> Deque[dict]:
-    d: Deque[dict] = deque(maxlen=config.HISTORY_LIMIT)
-    if items:
-        for item in items:
-            d.append(item)
-    return d
+def _init_user(user_id: int) -> None:
+    """Инициализирует пустую историю для пользователя, если её нет."""
+    if user_id not in _history:
+        _history[user_id] = {
+            "last_active": time.time(),
+            "messages": deque(maxlen=HISTORY_LIMIT)
+        }
 
 
-# user_id -> deque[{"role": "user"/"assistant", "content": str}]
-_history: dict[int, Deque[dict]] = defaultdict(_make_deque)
-# user_id -> str (краткая сводка прошлых разговоров)
-_summary: dict[int, str] = {}
+def _enforce_char_limit(user_id: int) -> None:
+    """Удаляет старые сообщения, если суммарный текст превышает MAX_CHARS."""
+    messages = _history[user_id]["messages"]
+    
+    # Считаем длину всех сообщений
+    total_chars = sum(len(m["content"]) for m in messages)
+    
+    # Пока текста слишком много — выкидываем самое старое сообщение (слева)
+    while total_chars > MAX_CHARS and len(messages) > 1:
+        removed_msg = messages.popleft()
+        total_chars -= len(removed_msg["content"])
 
 
-def _load() -> None:
-    if _FILE.exists():
-        try:
-            with open(_FILE, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            # Поддержка старого формата (просто dict[uid, list]) и нового (dict с "messages"/"summary")
-            for uid, data in raw.items():
-                if isinstance(data, list):
-                    _history[int(uid)] = _make_deque(data)
-                elif isinstance(data, dict):
-                    _history[int(uid)] = _make_deque(data.get("messages", []))
-                    s = data.get("summary")
-                    if s:
-                        _summary[int(uid)] = s
-        except (json.JSONDecodeError, OSError, ValueError):
-            pass
-
-
-def _save() -> None:
-    try:
-        snapshot = {}
-        all_uids = set(_history.keys()) | set(_summary.keys())
-        for uid in all_uids:
-            entry: dict = {}
-            if uid in _history and _history[uid]:
-                entry["messages"] = list(_history[uid])
-            if uid in _summary and _summary[uid]:
-                entry["summary"] = _summary[uid]
-            if entry:
-                snapshot[str(uid)] = entry
-        with open(_FILE, "w", encoding="utf-8") as f:
-            json.dump(snapshot, f, ensure_ascii=False, indent=2)
-    except OSError:
-        pass
+def cleanup_inactive() -> None:
+    """Удаляет из памяти пользователей, которые давно ничего не писали."""
+    current_time = time.time()
+    # Собираем ID тех, чье время вышло
+    dead_users = [
+        uid for uid, data in _history.items() 
+        if current_time - data["last_active"] > TTL_SECONDS
+    ]
+    for uid in dead_users:
+        del _history[uid]
 
 
 def add(user_id: int, role: str, content: str) -> None:
-    with _lock:
-        _history[user_id].append({"role": role, "content": content})
-        _save()
+    """Добавляет сообщение в историю пользователя."""
+    _init_user(user_id)
+    
+    _history[user_id]["last_active"] = time.time()
+    _history[user_id]["messages"].append({"role": role, "content": content})
+    
+    _enforce_char_limit(user_id)
 
 
-def get(user_id: int) -> list[dict]:
-    return list(_history[user_id])
-
-
-def get_summary(user_id: int) -> str | None:
-    return _summary.get(user_id) or None
-
-
-def set_summary(user_id: int, summary: str) -> None:
-    with _lock:
-        _summary[user_id] = summary.strip()
-        _save()
-
-
-def needs_summarization(user_id: int) -> bool:
-    """Если буфер переполнен — пора сжимать."""
-    return len(_history[user_id]) >= config.HISTORY_LIMIT
+def get(user_id: int) -> List[Dict[str, str]]:
+    """Возвращает историю пользователя в виде списка словарей."""
+    # При запросе истории заодно чистим старые сессии (чтобы не делать это по таймеру)
+    cleanup_inactive() 
+    
+    if user_id not in _history:
+        return []
+        
+    _history[user_id]["last_active"] = time.time()
+    return list(_history[user_id]["messages"])
 
 
 def reset(user_id: int) -> int:
-    with _lock:
-        n = len(_history[user_id])
-        _history[user_id].clear()
-        _summary.pop(user_id, None)
-        _save()
+    """Сбрасывает историю пользователя. Возвращает количество удаленных сообщений."""
+    if user_id in _history:
+        n = len(_history[user_id]["messages"])
+        del _history[user_id]  # Полностью очищаем память от юзера
         return n
+    return 0
 
 
-def trim_after_summary(user_id: int, keep_last: int = 4) -> None:
-    """После создания summary оставляем только последние N сообщений."""
-    with _lock:
-        items = list(_history[user_id])[-keep_last:]
-        _history[user_id] = _make_deque(items)
-        _save()
+# === ФУНКЦИИ ДЛЯ РАБОТЫ С ДИСКОМ ===
+
+def save() -> None:
+    """Сохраняет текущую историю в JSON файл."""
+    cleanup_inactive() # Чистим мусор перед сохранением
+    
+    export_data = {}
+    for uid, data in _history.items():
+        export_data[str(uid)] = {
+            "last_active": data["last_active"],
+            "messages": list(data["messages"]) # deque не сериализуется напрямую
+        }
+        
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(export_data, f, ensure_ascii=False, indent=2)
 
 
-_load()
-
-
+def load() -> None:
+    """Загружает историю из JSON файла при старте бота."""
+    if not os.path.exists(HISTORY_FILE):
+        return
+        
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            import_data = json.load(f)
+            
+        for uid_str, data in import_data.items():
+            uid = int(uid_str)
+            _history[uid] = {
+                "last_active": data["last_active"],
+                "messages": deque(data["messages"], maxlen=HISTORY_LIMIT)
+            }
+        # Сразу чистим тех, кто "протух", пока бот был выключен
+        cleanup_inactive()
+    except Exception as e:
+        print(f"[История] Ошибка при загрузке: {e}")
