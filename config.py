@@ -71,6 +71,10 @@ AUTO_FACTS_CHANCE = float(os.getenv("AUTO_FACTS_CHANCE", "0.5"))
 HEALTH_CHECK_INTERVAL = int(os.getenv("HEALTH_CHECK_INTERVAL", "120"))
 OPENROUTER_REQUEST_TIMEOUT = int(os.getenv("OPENROUTER_REQUEST_TIMEOUT", "60"))
 
+CHRONICLE_CHANNEL = int(os.getenv("CHRONICLE_CHANNEL") or 0)
+CHRONICLE_INTERVAL_HOURS = float(os.getenv("CHRONICLE_INTERVAL_HOURS", "168"))
+CHRONICLE_LOOKBACK_DAYS = int(os.getenv("CHRONICLE_LOOKBACK_DAYS", "7"))
+
 DISCORD_MSG_LIMIT = 2000
 
 # Баланс: порог (в кредитах) при котором показываем предупреждение в /quota

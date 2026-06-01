@@ -11,6 +11,7 @@ import traceback
 import discord
 from discord import app_commands
 
+import chronicle
 import config
 import history
 import llm
@@ -619,7 +620,14 @@ async def handle_message(message: discord.Message):
     # Сохраняем в историю и лог
     history.add(user_id, "user", prompt)
     history.add(user_id, "assistant", reply)
-    log_dialog(str(message.author), channel_label, prompt, reply)
+    log_dialog(
+        str(message.author),
+        channel_label,
+        prompt,
+        reply,
+        user_id=message.author.id,
+        channel_id=message.channel.id if message.guild else None,
+    )
     await asyncio.to_thread(history.save)
     user_data.record_interaction(user_id, affinity_delta=_affinity_delta_from_prompt(prompt))
 
@@ -652,6 +660,7 @@ async def on_ready():
     _spawn_task(_autopingtask(), "autoping_task")
     _spawn_task(_blurttask(), "blurred_task")
     _spawn_task(_ritualtask(), "ritual_task")
+    _spawn_task(_chronicletask(), "chronicle_task")
     _spawn_task(_healthchecktask(), "healthcheck_task")
 
     # Sync slash-команд
@@ -849,6 +858,8 @@ async def ask_cmd(interaction: discord.Interaction, prompt: str):
         prompt,
         reply,
         source="slash",
+        user_id=interaction.user.id,
+        channel_id=interaction.channel_id,
     )
     await asyncio.to_thread(history.save)
 
@@ -875,6 +886,21 @@ async def icebreaker_cmd(interaction: discord.Interaction):
         f"Коротко и по делу: какой один совет по '{t1}' сэкономил бы вам кучу нервов?",
     ]
     await interaction.response.send_message(random.choice(variants))
+
+
+@tree.command(name="chronicle", description="Показать летопись чата за N дней")
+@app_commands.describe(days="За сколько дней собрать сводку")
+async def chronicle_cmd(interaction: discord.Interaction, days: app_commands.Range[int, 1, 30] = 7):
+    await interaction.response.defer(thinking=True)
+
+    channel_label = f"#{interaction.channel}" if interaction.channel else "весь бот"
+    channel_id = interaction.channel_id if interaction.guild else None
+    report = chronicle.build_channel_chronicle(channel_label=channel_label, days=days, channel_id=channel_id)
+
+    chunks = _split_for_discord(report)
+    await interaction.followup.send(chunks[0])
+    for extra in chunks[1:]:
+        await interaction.followup.send(extra)
 
 
 @tree.command(name="status", description="Показать настройки бота")
@@ -1127,6 +1153,35 @@ async def _ritualtask() -> None:
             triggered = {k for k in triggered if today in k}
         except Exception:
             syslog.error("Ritual ошибка:\n%s", traceback.format_exc())
+
+async def _chronicletask() -> None:
+    """Раз в CHRONICLE_INTERVAL_HOURS постит летопись в CHRONICLE_CHANNEL."""
+    if not config.CHRONICLE_CHANNEL:
+        return
+    await client.wait_until_ready()
+    interval_seconds = config.CHRONICLE_INTERVAL_HOURS * 3600
+    last_post_ts = chronicle.load_last_post_ts()
+    if last_post_ts is not None:
+        elapsed = time.time() - last_post_ts
+        if elapsed < interval_seconds:
+            await asyncio.sleep(interval_seconds - elapsed)
+    while not client.is_closed():
+        await asyncio.sleep(interval_seconds)
+        try:
+            channel = client.get_channel(config.CHRONICLE_CHANNEL)
+            if not isinstance(channel, discord.TextChannel):
+                continue
+            report = chronicle.build_channel_chronicle(
+                channel_label=f"#{channel.name}",
+                days=config.CHRONICLE_LOOKBACK_DAYS,
+                channel_id=channel.id,
+            )
+            for chunk in _split_for_discord(report):
+                await channel.send(chunk)
+            chronicle.save_last_post_ts(time.time())
+            syslog.info("Chronicle posted in #%s", channel.name)
+        except Exception:
+            syslog.error("Chronicle ошибка:\n%s", traceback.format_exc())
 
 
 async def _healthchecktask() -> None:

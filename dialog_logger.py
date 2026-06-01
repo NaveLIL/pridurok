@@ -38,7 +38,15 @@ def _append_analysis_record(record: dict[str, object]) -> None:
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def log_dialog(user: str, channel: str, prompt: str, reply: str, source: str = "message") -> None:
+def log_dialog(
+    user: str,
+    channel: str,
+    prompt: str,
+    reply: str,
+    source: str = "message",
+    user_id: int | None = None,
+    channel_id: int | None = None,
+) -> None:
     timestamp = datetime.now(timezone.utc).isoformat()
     dialog.info(
         "USER=%s CH=%s\n  >> %s\n  << %s",
@@ -52,7 +60,9 @@ def log_dialog(user: str, channel: str, prompt: str, reply: str, source: str = "
             "ts": timestamp,
             "source": source,
             "user": user,
+            "user_id": user_id,
             "channel": channel,
+            "channel_id": channel_id,
             "prompt": prompt,
             "reply": reply,
         }
