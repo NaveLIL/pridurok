@@ -24,14 +24,32 @@ def _get_mem0():
         if _mem0 is not None:
             return _mem0
         import config as _cfg
+        import openai
+        
+        # Monkey-patch openai sync and async clients to drop response_format={"type": "json_object"}
+        # because OpenRouter and some local LLMs throw error 400 when they don't support it
+        old_create = openai.resources.chat.completions.Completions.create
+        def patched_create(*args, **kwargs):
+            if kwargs.get("response_format") == {"type": "json_object"}:
+                del kwargs["response_format"]
+            return old_create(*args, **kwargs)
+        openai.resources.chat.completions.Completions.create = patched_create
+        
+        old_async_create = openai.resources.chat.completions.AsyncCompletions.create
+        async def patched_async_create(*args, **kwargs):
+            if kwargs.get("response_format") == {"type": "json_object"}:
+                del kwargs["response_format"]
+            return await old_async_create(*args, **kwargs)
+        openai.resources.chat.completions.AsyncCompletions.create = patched_async_create
+
         from mem0 import Memory
         _mem0 = Memory.from_config({
             "llm": {
                 "provider": "openai",
                 "config": {
-                    "model": _cfg.LMSTUDIO_MODEL,
-                    "openai_base_url": _cfg.LMSTUDIO_BASE_URL,
-                    "api_key": _cfg.LMSTUDIO_API_KEY,
+                    "model": _cfg.OPENROUTER_MODEL,
+                    "openai_base_url": _cfg.OPENROUTER_BASE_URL,
+                    "api_key": _cfg.OPENROUTER_API_KEY,
                 },
             },
             "embedder": {
@@ -73,6 +91,15 @@ async def clear_memory(user_id: int) -> int:
     except Exception:
         return 0
 
+
+async def get_all_memory(user_id: int) -> list[str]:
+    """Возвращает все mem0-воспоминания."""
+    try:
+        result = await asyncio.to_thread(_get_mem0().get_all, user_id=str(user_id))
+        items: list[dict] = result.get("results", result) if isinstance(result, dict) else (result or [])
+        return [r["memory"] for r in items if isinstance(r, dict) and r.get("memory")]
+    except Exception:
+        return []
 
 async def search_memory(user_id: int, query: str, limit: int = 5) -> list[str]:
     """Ищет релевантные воспоминания о пользователе по смыслу запроса."""

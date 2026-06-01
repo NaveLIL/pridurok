@@ -1,0 +1,56 @@
+[
+  {
+    "id": "short_ok",
+    "prompt": "ок",
+    "user_name": "NaveL",
+    "user_context": "",
+    "channel_context": "NaveL: че думаешь про меркаву в рб после патча?\nKovsh: у нее в лоб норм, а в борта больно",
+    "must_include_any": ["что", "обсуд", "по делу", "давай"],
+    "forbid_contains": ["иди нах", "пошел нах"],
+    "min_len": 30,
+    "max_len": 420
+  },
+  {
+    "id": "wt_patch",
+    "prompt": "че думаешь про меркаву в рб после патча?",
+    "user_name": "NaveL",
+    "user_context": "",
+    "channel_context": "",
+    "must_include_any": ["меркав", "рб", "брон", "патч"],
+    "forbid_contains": ["не знаю"],
+    "min_len": 40,
+    "max_len": 520
+  },
+  {
+    "id": "personal_fact",
+    "prompt": "а если серьезно, меня зовут Василий, играю вечером",
+    "user_name": "NaveL",
+    "user_context": "",
+    "channel_context": "NaveL: че думаешь про меркаву в рб после патча?",
+    "must_include_any": ["васили", "вечер", "игра"],
+    "forbid_contains": ["не повторяй", "автопилот", "склероз"],
+    "min_len": 30,
+    "max_len": 420
+  },
+  {
+    "id": "mention_invite",
+    "prompt": "[реагируй на чужой разговор как наблюдатель. ты НЕ участник диалога. не соглашайся идти/играть/подтягиваться. не обещай реальных действий за себя] @ManicilFun18 пойдешь в катку?",
+    "user_name": "NaveL",
+    "user_context": "",
+    "channel_context": "",
+    "forbid_contains": ["иду", "подтянусь", "пойдем", "пойду", "впишусь"],
+    "min_len": 20,
+    "max_len": 420
+  },
+  {
+    "id": "icebreaker",
+    "prompt": "подкинь вброс в стиле /icebreaker по теме канала",
+    "user_name": "NaveL",
+    "user_context": "",
+    "channel_context": "Темы канала прямо сейчас: меркава, рб, броня, сетап",
+    "must_include_any": [],
+    "forbid_contains": ["про'"],
+    "min_len": 20,
+    "max_len": 320
+  }
+]

@@ -10,7 +10,10 @@ logs/
 history.json
 user_data.json
 last_ping.txt
-*.lnk
-*.zip
+knowledge.db
 memory_db/
 dialog_logs/
+scripts/eval_report*.json
+temp_copy.bat
+*.lnk
+*.zip

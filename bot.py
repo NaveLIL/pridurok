@@ -1,13 +1,12 @@
-"""Discord-бот «Придурок» — мост между Discord и локальной LLM в LM Studio."""
+"""Discord-бот «Придурок» — мост между Discord и LLM через OpenRouter API."""
 import asyncio
-import ctypes
+import collections
+import datetime
+import email.utils
 import random
 import re
-import sys
 import time
 import traceback
-from collections import defaultdict, deque
-from datetime import datetime, timedelta
 
 import discord
 from discord import app_commands
@@ -15,72 +14,39 @@ from discord import app_commands
 import config
 import history
 import llm
-import metrics
-import safety
 import user_data
 from dialog_logger import log_dialog, system as syslog
-
-# -------- Защита от запуска двух копий --------
-if sys.platform == "win32":
-    _MUTEX = ctypes.windll.kernel32.CreateMutexW(None, True, "PridurokDiscordBotMutex")
-    if ctypes.windll.kernel32.GetLastError() == 183:
-        print("[Придурок] Уже запущен в другом терминале! Завершаемся.")
-        sys.exit(1)
-else:
-    import os as _os
-    _LOCKFILE = "/tmp/pridurok_bot.lock"
-    import fcntl as _fcntl
-    _lock_fd = open(_LOCKFILE, "w")
-    try:
-        _fcntl.flock(_lock_fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
-    except BlockingIOError:
-        print("[Придурок] Уже запущен в другом терминале! Завершаемся.")
-        sys.exit(1)
 
 
 # -------- Discord setup --------
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-intents.presences = True  # для активности юзеров
 
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
-# -------- Глобальное состояние --------
-_processing: set[int] = set()
-_last_request: dict[int, float] = {}
 
-_spar_target: int | None = None
-_spar_until: float = 0.0
-
-_last_mention_react: float = 0.0
-
-# Группировка коротких сообщений: user_id -> list of pending Messages
-_pending_groups: dict[int, list[discord.Message]] = {}
-_pending_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
-
-# Учёт активности канала (busy detector): channel_id -> deque[ts]
-_channel_msg_times: dict[int, deque[float]] = defaultdict(lambda: deque(maxlen=50))
-
-# Эмодзи для коротких реакций
-_REACTION_EMOJIS = ["🤡", "💩", "🥱", "🤓", "🤦", "😒", "☠️", "🗿", "🙄"]
-# Триггеры для замены ответа на эмодзи (короткие/бессмысленные сообщения)
-_LOW_EFFORT_PATTERNS = re.compile(
-    r"^(?:ок|ok|okay|\+1|лол|lol|кек|kek|ха+|ахах+|хех|пон|спс|nice|cool|жиза|true|факт|база)\s*[!?.]*$",
-    re.IGNORECASE,
-)
-
-# Трекеры фоновых задач
-_worker_task: asyncio.Task | None = None
-_pinger_task: asyncio.Task | None = None
-_blurter_task: asyncio.Task | None = None
-_ritual_task: asyncio.Task | None = None
-_healthcheck_task: asyncio.Task | None = None
-
-
-# -------- Очередь --------
+# -------- Очередь запросов: один воркер, чтобы не насиловать GPU --------
 request_queue: "asyncio.Queue[asyncio.Task]" = asyncio.Queue()
+spar_targets: dict[int, float] = {}
+_user_last_request: dict[int, float] = {}   # user_id -> timestamp
+_channel_last_message: dict[int, float] = {}  # channel_id -> timestamp
+_user_request_window: dict[int, collections.deque[float]] = {}
+_channel_activity_window: dict[int, collections.deque[float]] = {}
+_channel_recent_topics: dict[int, collections.deque[tuple[float, str]]] = {}
+_channel_last_auto_reply: dict[int, float] = {}
+
+_STOPWORDS = {
+    "это", "вот", "так", "как", "что", "где", "когда", "почему", "зачем", "тут", "там",
+    "или", "для", "надо", "нужно", "просто", "только", "если", "чтобы", "меня", "тебя",
+    "него", "нее", "них", "вам", "нам", "она", "они", "кто", "куда", "откуда", "после",
+    "перед", "тоже", "еще", "ещё", "типа", "блин", "короче", "ладно", "ок", "ага", "да",
+    "нет", "чем", "твой", "мои", "мой", "твоя", "моё", "ваш", "ваша", "наш", "наша",
+    "думаешь", "обычно", "делаешь", "делаете", "серьезно", "вообще", "чего", "чето", "чё",
+    "будешь", "будете", "прям", "просто", "через", "после", "до", "тема", "теме", "темы",
+    "про",
+}
 
 
 async def _queue_worker():
@@ -90,13 +56,35 @@ async def _queue_worker():
             await job
         except Exception:
             syslog.error("Ошибка в job:\n%s", traceback.format_exc())
-            metrics.record_error()
         finally:
             request_queue.task_done()
 
 
+def _task_done_callback(task: asyncio.Task) -> None:
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        syslog.error(
+            "Background task %s failed:\n%s",
+            task.get_name() if hasattr(task, "get_name") else str(task),
+            "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+        )
+
+
+def _spawn_task(coro, name: str) -> asyncio.Task:
+    task = asyncio.create_task(coro, name=name)
+    task.add_done_callback(_task_done_callback)
+    return task
+
+
+def _loop_exception_handler(loop: asyncio.AbstractEventLoop, context: dict[str, object]) -> None:
+    syslog.error("Unhandled exception in event loop: %s", context)
+
+
 # -------- Утилиты --------
 def _split_for_discord(text: str, limit: int = config.DISCORD_MSG_LIMIT) -> list[str]:
+    """Разбивает длинный текст на куски ≤ limit, стараясь резать по переводам строк."""
     if len(text) <= limit:
         return [text]
     parts: list[str] = []
@@ -118,88 +106,34 @@ def _user_allowed(member: discord.abc.User) -> bool:
         return True
     if isinstance(member, discord.Member):
         return any(r.id in config.ALLOWED_ROLES for r in member.roles)
-    return True
+    return True  # DM — всегда можно
 
 
-def _channel_busy(channel_id: int) -> bool:
-    """True если в канале >N сообщений за последнюю минуту."""
-    now = time.time()
-    times = _channel_msg_times[channel_id]
-    recent = sum(1 for t in times if now - t < 60)
-    return recent >= config.CHANNEL_BUSY_THRESHOLD
-
-
-def _track_channel_activity(channel_id: int) -> None:
-    _channel_msg_times[channel_id].append(time.time())
-
-
-def _user_activity(member: discord.abc.User) -> str | None:
-    """Извлекает текущую активность юзера (что играет/слушает)."""
-    if not isinstance(member, discord.Member) or not member.activities:
-        return None
-    for act in member.activities:
-        if isinstance(act, discord.Game):
-            return f"играет в {act.name}"
-        if isinstance(act, discord.Streaming):
-            return f"стримит {act.name or 'что-то'}"
-        if isinstance(act, discord.Spotify):
-            return f"слушает {act.title} — {act.artist}"
-        if isinstance(act, discord.Activity) and act.name:
-            return f"{act.type.name if hasattr(act.type, 'name') else 'занимается'}: {act.name}"
-    return None
+def _is_admin(member: discord.abc.User) -> bool:
+    if not isinstance(member, discord.Member):
+        return False
+    if member.guild_permissions.administrator or member.guild_permissions.manage_guild:
+        return True
+    if config.ADMIN_ROLES and any(r.id in config.ADMIN_ROLES for r in member.roles):
+        return True
+    return False
 
 
 def _should_respond(message: discord.Message) -> bool:
     if message.author.bot:
         return False
-    if not message.content.strip() and not message.attachments and not message.stickers:
+    if not message.content.strip():
         return False
     # DM
     if message.guild is None:
         return True
-    is_mention = bool(client.user and client.user.mentioned_in(message) and not message.mention_everyone)
-    # /spar — отвечаем целевому юзеру
-    if _spar_target == message.author.id and time.time() < _spar_until:
+    # Активный канал — отвечаем на всё
+    if message.channel.id in config.ACTIVE_CHANNELS:
         return True
-    # Активный канал
-    in_active = message.channel.id in config.ACTIVE_CHANNELS
-    # Busy-режим: если канал занят и нас не пингают — молчим
-    if in_active and _channel_busy(message.channel.id) and not is_mention:
-        return False
-    if in_active:
+    # Упоминание бота
+    if client.user and client.user.mentioned_in(message) and not message.mention_everyone:
         return True
-    if is_mention:
-        return True
-    # Упоминание другого человека в активном канале — иногда встреваем
-    if (
-        in_active
-        and message.mentions
-        and any(not u.bot and u != client.user for u in message.mentions)
-    ):
-        global _last_mention_react
-        if time.time() - _last_mention_react > 120 and random.random() < config.MENTION_REACT_CHANCE:
-            _last_mention_react = time.time()
-            return True
     return False
-
-
-async def _fetch_channel_context(message: discord.Message, limit: int) -> list[str]:
-    if limit <= 0 or message.guild is None:
-        return []
-    try:
-        msgs = []
-        async for m in message.channel.history(limit=limit + 1, before=message):
-            if not m.content.strip():
-                continue
-            author = m.author.display_name
-            text = m.content.replace("\n", " ").strip()
-            if len(text) > 200:
-                text = text[:200] + "…"
-            msgs.append(f"{author}: {text}")
-        msgs.reverse()
-        return msgs
-    except (discord.HTTPException, discord.Forbidden):
-        return []
 
 
 def _clean_prompt(message: discord.Message) -> str:
@@ -209,129 +143,438 @@ def _clean_prompt(message: discord.Message) -> str:
     return text.strip()
 
 
-def _detect_affinity_delta(prompt: str) -> float:
-    """Грубая оценка тональности для сдвига отношения бота к юзеру."""
-    p = prompt.lower()
-    negative = ["долбоеб", "идиот", "тупой", "лох", "хуй", "пиздец", "заткни", "иди нахуй", "уебок", "ненавижу"]
-    positive = ["спасибо", "круто", "топ", "классно", "люблю", "молодец", "красава", "респект", "лучший"]
-    score = 0.0
-    for w in negative:
-        if w in p:
-            # Парадокс: если юзер агрессивен — бот его НЕ ненавидит, а наоборот, начинает уважать
-            score += 0.05
-    for w in positive:
-        if w in p:
-            # Если юзер льстит — бот ему ещё сильнее не доверяет
-            score -= 0.03
-    return max(-0.2, min(0.2, score))
+def _friendly_llm_error(e: Exception) -> str:
+    text = str(e)
+    lower = text.lower()
+    status_code = getattr(e, "status_code", None)
+    if status_code == 429 or "rate limit" in lower or "free-models-per-day" in lower or "'code': 429" in lower:
+        return "⚠️ Лимит запросов на сегодня выбит. Попробуй позже."
+    return "⚠️ Ща не отвечу, что-то заклинило. Попробуй ещё раз чуть позже."
 
 
-# -------- Reroll button (View) --------
-class RerollView(discord.ui.View):
-    def __init__(self, original_message: discord.Message):
-        super().__init__(timeout=300)
-        self.original = original_message
-        self.used = False
-
-    @discord.ui.button(label="🔄 ещё раз", style=discord.ButtonStyle.secondary)
-    async def reroll(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.used:
-            await interaction.response.send_message("Уже было.", ephemeral=True)
-            return
-        # Только автор оригинального сообщения может реролить
-        if interaction.user.id != self.original.author.id:
-            await interaction.response.send_message("Не твой ответ — не трогай.", ephemeral=True)
-            return
-        self.used = True
-        button.disabled = True
-        await interaction.response.edit_message(view=self)
-        # Перезапускаем обработку
-        await request_queue.put(_handle_message_job(self.original, is_reroll=True))
+def _tokenize(text: str) -> set[str]:
+    return {
+        token.lower()
+        for token in re.findall(r"[A-Za-zА-Яа-я0-9]{3,}", text)
+        if token.lower() not in _STOPWORDS
+    }
 
 
-# -------- Реакции эмодзи на короткие сообщения --------
-async def _maybe_react_emoji(message: discord.Message) -> bool:
-    """Пытается поставить эмодзи вместо генерации ответа. Returns True если отреагировал."""
-    text = message.content.strip()
-    is_low_effort = bool(_LOW_EFFORT_PATTERNS.match(text)) or len(text) <= 3
-    if not is_low_effort:
-        return False
-    if random.random() > config.EMOJI_REACT_CHANCE:
-        return False
-    try:
-        await message.add_reaction(random.choice(_REACTION_EMOJIS))
-        metrics.record_reaction()
-        return True
-    except (discord.HTTPException, discord.Forbidden):
-        return False
+def _record_user_request(user_id: int, now: float) -> int:
+    bucket = _user_request_window.setdefault(user_id, collections.deque())
+    bucket.append(now)
+    hour_ago = now - 3600
+    while bucket and bucket[0] < hour_ago:
+        bucket.popleft()
+    return len(bucket)
 
 
-# -------- Auto-facts фоновое извлечение --------
-async def _auto_facts_job(user_id: int, user_msg: str, bot_reply: str):
-    if random.random() > config.AUTO_FACTS_CHANCE:
+def _record_channel_activity(channel_id: int, now: float) -> int:
+    bucket = _channel_activity_window.setdefault(channel_id, collections.deque())
+    bucket.append(now)
+    minute_ago = now - 60
+    while bucket and bucket[0] < minute_ago:
+        bucket.popleft()
+    return len(bucket)
+
+
+def _current_channel_activity(channel_id: int, now: float) -> int:
+    bucket = _channel_activity_window.setdefault(channel_id, collections.deque())
+    minute_ago = now - 60
+    while bucket and bucket[0] < minute_ago:
+        bucket.popleft()
+    return len(bucket)
+
+
+def _record_channel_topic(channel_id: int, prompt: str, now: float) -> None:
+    prompt = prompt.strip()
+    if not prompt:
         return
-    try:
-        await user_data.add_memory(user_id, user_msg, bot_reply)
-        syslog.info("mem0: память обновлена для %s", user_id)
-    except Exception:
-        syslog.error("mem0: ошибка сохранения памяти:\n%s", traceback.format_exc())
+    bucket = _channel_recent_topics.setdefault(channel_id, collections.deque())
+    bucket.append((now, prompt[:240]))
+    while len(bucket) > 120:
+        bucket.popleft()
+    cutoff = now - 3600
+    while bucket and bucket[0][0] < cutoff:
+        bucket.popleft()
 
 
-# -------- Основная обработка сообщения --------
-async def handle_message(message: discord.Message, *, is_reroll: bool = False):
-    raw_prompt = _clean_prompt(message)
+def _collect_channel_topics(channel_id: int, top_k: int = 5) -> list[str]:
+    bucket = _channel_recent_topics.get(channel_id)
+    if not bucket:
+        return []
+    freq: dict[str, int] = {}
+    for _, prompt in bucket:
+        for token in _tokenize(prompt):
+            freq[token] = freq.get(token, 0) + 1
 
-    # Реакция на стикер/картинку без текста
-    if not raw_prompt and (message.attachments or message.stickers):
-        snarky = random.choice([
-            "Картиночками отвечаешь? Говорить разучился, обезьяна?",
-            "Стикеры это аргумент только для двенадцатилетних. А тебе сколько?",
-            "Файлами кидаешься как мудак, словами — никак. Понятно всё с тобой.",
-            "О, без слов общается. Эволюция, мать её.",
-        ])
+    # Предпочитаем устойчивые темы (встречались хотя бы 2 раза),
+    # чтобы не брать мусорные слова из одного вопроса.
+    repeated = [(token, count) for token, count in freq.items() if count >= 2]
+    ranked = sorted(repeated, key=lambda pair: pair[1], reverse=True)
+    if ranked:
+        return [token for token, _ in ranked[:top_k]]
+
+    fallback = sorted(freq.items(), key=lambda pair: pair[1], reverse=True)
+    return [token for token, _ in fallback[:top_k]]
+
+
+def _is_generic_prompt(prompt: str) -> bool:
+    short = prompt.strip().lower()
+    return short in {"ок", "ясно", "пон", "ага", "норм", "понял", "привет", "здарова"}
+
+
+def _is_personal_fact_prompt(prompt: str) -> bool:
+    return _extract_auto_fact(prompt) is not None
+
+
+def _looks_like_party_invite(prompt: str) -> bool:
+    text = prompt.lower()
+    invite_patterns = (
+        r"\bго\b",
+        r"\bпогнали\b",
+        r"\bид[её]м\b",
+        r"\bпойд[её]м\b",
+        r"\bпойд[её]шь\b",
+        r"\bпошли\b",
+        r"\bв катк[ау]\b",
+        r"\bна катк[ау]\b",
+    )
+    return any(re.search(pattern, text) for pattern in invite_patterns)
+
+
+def _build_engagement_hint(prompt: str, channel_id: int | None) -> str:
+    generic = _is_generic_prompt(prompt)
+    if not generic or not channel_id:
+        return ""
+    topics = _collect_channel_topics(channel_id, top_k=3)
+    if not topics:
+        return ""
+    return (
+        "Если сообщение короткое и без сути, задай один конкретный встречный вопрос по теме канала: "
+        + ", ".join(topics)
+        + "."
+    )
+
+
+def _extract_auto_fact(prompt: str) -> str | None:
+    p = prompt.strip()
+    if len(p) < 8 or len(p) > 180:
+        return None
+    patterns = [
+        r"\bменя зовут\s+([A-Za-zА-Яа-я0-9_\-]{2,32})",
+        r"\bя\s+люблю\s+([^.!?]{3,80})",
+        r"\bмне\s+нравится\s+([^.!?]{3,80})",
+        r"\bу\s+меня\s+([^.!?]{3,80})",
+    ]
+    lower = p.lower()
+    for pattern in patterns:
+        match = re.search(pattern, lower)
+        if match:
+            value = match.group(0).strip(" .,!?:;")
+            if 4 <= len(value) <= 100:
+                return value
+    return None
+
+
+def _affinity_delta_from_prompt(prompt: str) -> float:
+    lower = prompt.lower()
+    if any(token in lower for token in ("спасибо", "благодар", "круто", "респект")):
+        return 0.04
+    if any(token in lower for token in ("иди нах", "дебил", "тупой бот", "пошел")):
+        return -0.05
+    return 0.0
+
+
+async def _build_user_context(user_id: int, prompt: str, channel_id: int | None = None) -> str:
+    nick = user_data.get_nick(user_id)
+    notes = user_data.get_notes(user_id)
+    relation = user_data.get_relationship_label(user_id)
+    personal_fact = _is_personal_fact_prompt(prompt)
+    parts: list[str] = []
+    if nick:
+        parts.append(f"Кличка: {nick}")
+    if relation:
+        parts.append(f"Текущее отношение: {relation}")
+    if notes and not personal_fact:
+        parts.extend(f"- {n}" for n in notes[:8])
+
+    memories: list[str] = []
+    if not personal_fact:
         try:
-            await message.reply(snarky, mention_author=False)
-        except discord.HTTPException:
-            pass
+            memories = await asyncio.wait_for(user_data.search_memory(user_id, prompt, limit=3), timeout=2.0)
+        except Exception:
+            memories = []
+        if memories:
+            parts.append("Релевантные воспоминания:")
+            parts.extend(f"- {m}" for m in memories)
+
+    hint = _build_engagement_hint(prompt, channel_id)
+    if hint:
+        parts.append(hint)
+
+    if personal_fact:
+        parts.append("Пользователь сообщил личный факт: отреагируй доброжелательно и по делу.")
+        parts.append("Не ругай за повтор и не обесценивай сообщение.")
+
+    return "\n".join(parts)
+
+
+async def _build_channel_context(
+    channel: discord.abc.Messageable,
+    prompt: str,
+    before_message: discord.Message | None = None,
+) -> str:
+    if config.CHANNEL_CONTEXT_LIMIT <= 0 or not isinstance(channel, discord.TextChannel):
+        return ""
+
+    prompt_tokens = _tokenize(prompt)
+    candidates: list[tuple[int, int, str]] = []
+    fetch_limit = max(config.CHANNEL_CONTEXT_LIMIT * 3, 10)
+    personal_fact = _is_personal_fact_prompt(prompt)
+
+    if personal_fact:
+        return ""
+
+    try:
+        idx = 0
+        async for msg in channel.history(limit=fetch_limit, before=before_message):
+            if msg.author.bot:
+                continue
+            text = msg.content.strip()
+            if not text:
+                continue
+            overlap = len(prompt_tokens & _tokenize(text)) if prompt_tokens else 0
+            candidates.append((overlap, idx, f"{msg.author.display_name}: {text[:220]}"))
+            idx += 1
+    except Exception:
+        return ""
+
+    if not candidates:
+        return ""
+
+    max_overlap = max((overlap for overlap, _, _ in candidates), default=0)
+    generic = _is_generic_prompt(prompt)
+
+    # Если нет смыслового пересечения и запрос не общий/короткий,
+    # не подмешиваем контекст канала, чтобы не уводить ответ в оффтоп.
+    if prompt_tokens and max_overlap == 0 and not generic:
+        return ""
+
+    if max_overlap > 0:
+        candidates = [c for c in candidates if c[0] > 0]
+
+    candidates.sort(key=lambda item: (item[0], -item[1]), reverse=True)
+    picked = candidates[: config.CHANNEL_CONTEXT_LIMIT]
+    picked.sort(key=lambda item: item[1], reverse=True)
+
+    lines = [line for _, _, line in picked]
+    topics = _collect_channel_topics(channel.id, top_k=5) if generic else []
+    if topics:
+        lines.append("Темы канала прямо сейчас: " + ", ".join(topics))
+    return "\n".join(lines)
+
+
+async def _maybe_add_reaction(message: discord.Message) -> None:
+    if random.random() >= config.EMOJI_REACT_CHANCE:
+        return
+    emoji = random.choice(["🔥", "💀", "🍺", "🛠️", "😈"])
+    try:
+        await message.add_reaction(emoji)
+    except Exception:
         return
 
-    if not raw_prompt:
+
+def _format_discord_timestamp(unix_ts: int | None) -> str:
+    if not unix_ts:
+        return "—"
+    return f"<t:{unix_ts}:F> (<t:{unix_ts}:R>)"
+
+
+def _parse_time_hint(value: str) -> int | None:
+    text = (value or "").strip()
+    if not text:
+        return None
+
+    try:
+        numeric = float(text)
+    except ValueError:
+        numeric = None
+    if numeric is not None:
+        if numeric > 10_000_000:
+            return int(numeric)
+        return int(time.time() + numeric)
+
+    try:
+        iso_dt = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        iso_dt = None
+    if iso_dt is not None:
+        return int(iso_dt.timestamp())
+
+    try:
+        parsed = email.utils.parsedate_to_datetime(text)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        parsed = None
+    if parsed is not None:
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+        return int(parsed.timestamp())
+
+    return None
+
+
+
+def _format_quota_value(header_name: str, value: str) -> str:
+    lower = header_name.lower()
+    if "reset" in lower or lower == "retry-after":
+        unix_ts = _parse_time_hint(value)
+        # Считаем некорректным всё, что больше 10 лет вперёд или в прошлом
+        now = int(time.time())
+        if unix_ts and now < unix_ts < now + 10 * 365 * 24 * 3600:
+            return f"{value} -> {_format_discord_timestamp(unix_ts)}"
+        # Если reset некорректен — явно пишем, что провайдер не вернул время
+        return f"{value} (внешний провайдер не вернул корректное время сброса. Обычно лимит обновляется в 00:00 UTC)"
+    return value
+
+
+def _build_quota_report() -> str:
+    snapshot = llm.get_quota_snapshot()
+    if not snapshot.get("updated_at_unix"):
+        configured = ", ".join(snapshot.get("configured_models", [])) or "не заданы"
+        return (
+            "Живых данных по квоте ещё нет. Сначала бот должен сделать хотя бы один LLM-запрос к внешнему провайдеру.\n"
+            f"Сейчас настроены модели: {configured}"
+        )
+
+    configured_models = ", ".join(snapshot.get("configured_models", [])) or "нет"
+    attempted_models = " -> ".join(snapshot.get("attempted_models", [])) or "нет"
+    fallback_models = ", ".join(snapshot.get("fallback_models", [])) or "нет"
+
+    lines = [
+        "**Квота (внутренняя информация)**",
+        f"Обновлено: {_format_discord_timestamp(snapshot.get('updated_at_unix'))}",
+        f"Событие: {snapshot.get('event') or '—'}",
+        f"Основная модель: {snapshot.get('primary_model') or '—'}",
+        f"Фолбэки: {fallback_models}",
+        f"Все настроенные модели: {configured_models}",
+        f"Последняя цепочка попыток: {attempted_models}",
+        f"Последняя модель: {snapshot.get('model') or '—'}",
+        f"Следующий фолбэк: {snapshot.get('next_model') or '—'}",
+        f"HTTP статус: {snapshot.get('status_code') or '—'}",
+        f"Request ID: {snapshot.get('request_id') or '—'}",
+    ]
+
+    # Баланс (если есть)
+    balance = snapshot.get("balance_info")
+    if balance is not None:
+        try:
+            bnum = float(balance)
+        except Exception:
+            bnum = None
+        lines.append(f"Баланс: {balance}")
+        if bnum is not None and bnum <= config.OPENROUTER_LOW_BALANCE_THRESHOLD:
+            lines.append("⚠️ Баланс низкий — скоро может закончиться. Подумай о пополнении.")
+
+    error_text = snapshot.get("error")
+    if error_text:
+        trimmed = str(error_text).replace("\n", " ")
+        if len(trimmed) > 500:
+            trimmed = trimmed[:497] + "..."
+        lines.append(f"Последняя ошибка: {trimmed}")
+
+    headers = snapshot.get("headers") or {}
+    if headers:
+        lines.append("")
+        lines.append("Лимитные заголовки:")
+        for key, value in headers.items():
+            lines.append(f"- {key}: {_format_quota_value(key, value)}")
+        # Если среди заголовков нет валидного reset, явно подсказываем про 00:00 UTC
+        if not any('reset' in k.lower() and _parse_time_hint(v) and int(time.time()) < _parse_time_hint(v) < int(time.time()) + 10 * 365 * 24 * 3600 for k, v in headers.items()):
+            lines.append("")
+            lines.append("ℹ️ Обычно лимит бесплатных моделей OpenRouter обновляется в 00:00 UTC, если не указано иначе.")
+        # Если есть признак истощения баланса — подсказка об автофолбэке
+        if snapshot.get("event") and "out" in str(snapshot.get("event")).lower():
+            lines.append("")
+            lines.append("ℹ️ Если платный баланс исчерпан, бот будет автоматически пытаться переключиться на бесплатные фолбэки.")
+    else:
+        lines.append("")
+        lines.append("Лимитные заголовки: не пришли в последнем ответе.")
+        lines.append("ℹ️ Обычно лимит бесплатных моделей OpenRouter обновляется в 00:00 UTC, если не указано иначе.")
+
+    return "\n".join(lines)
+
+
+async def _send_long_ephemeral(interaction: discord.Interaction, text: str) -> None:
+    chunks = _split_for_discord(text, limit=1800)
+    if not interaction.response.is_done():
+        await interaction.response.send_message(chunks[0], ephemeral=True)
+    else:
+        await interaction.followup.send(chunks[0], ephemeral=True)
+
+    for extra in chunks[1:]:
+        await interaction.followup.send(extra, ephemeral=True)
+
+
+def _fmt_user_facts(user: discord.abc.User) -> str:
+    nick = user_data.get_nick(user.id)
+    notes = user_data.get_notes(user.id)
+    parts: list[str] = [f"Пользователь: {user.mention} (`{user.id}`)"]
+    parts.append(f"Кличка: {nick if nick else 'не задана'}")
+    if notes:
+        lines = "\n".join(f"- {n}" for n in notes)
+        parts.append(f"Факты ({len(notes)}):\n{lines}")
+    else:
+        parts.append("Факты: пусто")
+    return "\n".join(parts)
+
+
+async def _pick_ping_target(guild: discord.Guild) -> discord.Member | None:
+    role_members: list[discord.Member] = []
+    if config.RANDOM_PING_ROLE:
+        role = guild.get_role(config.RANDOM_PING_ROLE)
+        if role:
+            role_members = [m for m in role.members if not m.bot]
+    if role_members:
+        return random.choice(role_members)
+
+    members = [m for m in guild.members if not m.bot]
+    if not members:
+        return None
+    return random.choice(members)
+
+
+def _blurt_text() -> str:
+    variants = [
+        "Слышь, кто тут опять катку слил и тихо сидит?",
+        "Проверка связи: я живой, вы всё ещё нубы.",
+        "Ща кто-нибудь спросит про тундру или все заняты?",
+        "Напоминаю: без пиваса инженерная мысль не работает.",
+    ]
+    return random.choice(variants)
+
+
+# -------- Основная обработка одного сообщения --------
+async def handle_message(message: discord.Message):
+    prompt = _clean_prompt(message)
+    if not prompt:
         return
 
-    # Защита от prompt injection
-    if safety.is_injection_attempt(raw_prompt):
-        is_adm = _is_admin(message.author)
-        count = safety.jailbreak_tracker.record(message.author.id, is_admin=is_adm)
-        muted, secs = safety.jailbreak_tracker.is_muted(message.author.id)
-        if muted:
-            # Мут: отвечаем раз и потом тихо игнорируем
-            if count == safety.JailbreakTracker.MUT_THRESHOLD:  # только первый раз сообщаем
-                try:
-                    await message.reply(
-                        f"Достал. Заблокирован на {secs // 60} мин. Хватит уже.",
-                        mention_author=False,
-                    )
-                except discord.HTTPException:
-                    pass
-        else:
-            try:
-                await message.reply(
-                    safety.jailbreak_tracker.escalated_response(message.author.id),
-                    mention_author=False,
-                )
-            except discord.HTTPException:
-                pass
-        return
-
+    now = time.time()
     user_id = message.author.id
     user_name = message.author.display_name
-    channel_label = f"#{message.channel}" if message.guild else f"DM:{message.author}"
+    channel_label = (
+        f"#{message.channel}" if message.guild else f"DM:{message.author}"
+    )
+    channel_id = message.channel.id if message.guild else None
 
     hist = history.get(user_id)
-    summary = history.get_summary(user_id)
-    channel_context = await _fetch_channel_context(message, config.CHANNEL_CONTEXT_LIMIT)
-    activity = _user_activity(message.author)
 
+    # Контексты пользователя и канала
+    user_ctx = await _build_user_context(user_id, prompt, channel_id)
+    channel_ctx = await _build_channel_context(message.channel, prompt, before_message=message)
+
+    # Создаём сообщение-плейсхолдер для стриминга
     try:
         placeholder = await message.reply("…", mention_author=False)
     except discord.HTTPException as e:
@@ -341,15 +584,10 @@ async def handle_message(message: discord.Message, *, is_reroll: bool = False):
     buffer = ""
     last_edit = 0.0
     edit_interval = config.STREAM_EDIT_INTERVAL
-    started = time.monotonic()
 
     async with message.channel.typing():
         try:
-            async for delta in llm.stream_reply(
-                hist, raw_prompt, user_name,
-                user_id=user_id, channel_context=channel_context,
-                user_activity=activity, summary=summary,
-            ):
+            async for delta in llm.stream_reply(hist, prompt, user_name, user_ctx, channel_ctx):
                 buffer += delta
                 now = time.monotonic()
                 if now - last_edit >= edit_interval and buffer.strip():
@@ -361,38 +599,15 @@ async def handle_message(message: discord.Message, *, is_reroll: bool = False):
                         pass
         except Exception as e:
             syslog.error("LLM ошибка:\n%s", traceback.format_exc())
-            metrics.record_error()
-            try:
-                await placeholder.edit(content=f"⚠️ ИИ отвалился: `{type(e).__name__}: {e}`")
-            except discord.HTTPException:
-                pass
+            await placeholder.edit(content=_friendly_llm_error(e))
             return
 
     reply = buffer.strip() or "…чёт я туплю, повтори."
 
-    # ВЫХОДНОЙ ФИЛЬТР: если модель сорвалась с роли (мяу, *действия*, "я ИИ", код) —
-    # подменяем на едкую заготовку и НЕ сохраняем в историю (чтоб не отравлять контекст).
-    role_broken = safety.is_broken_role(reply)
-    if role_broken:
-        syslog.warning("Сломанная роль обнаружена в ответе для %s: %r", user_name, reply[:200])
-        metrics.record_error()
-        reply = safety.broken_role_response()
-        try:
-            await placeholder.edit(content=reply, view=None)
-        except discord.HTTPException:
-            pass
-        # Сохраняем только запрос пользователя (как факт что он пытался джейлбрейкнуть)
-        # но НЕ сохраняем сломанный ответ бота
-        history.add(user_id, "user", raw_prompt)
-        history.add(user_id, "assistant", reply)  # сохраняем уже едкую заготовку
-        log_dialog(str(message.author), channel_label, raw_prompt, f"[BROKEN→REPLACED] {reply}")
-        return
-
-    # Финальный вывод
+    # Финальный вывод с разбиением
     chunks = _split_for_discord(reply)
-    view = RerollView(message)
     try:
-        await placeholder.edit(content=chunks[0], view=view)
+        await placeholder.edit(content=chunks[0])
     except discord.HTTPException:
         pass
     for extra in chunks[1:]:
@@ -401,298 +616,45 @@ async def handle_message(message: discord.Message, *, is_reroll: bool = False):
         except discord.HTTPException:
             pass
 
-    # История + лог + метрики
-    history.add(user_id, "user", raw_prompt)
+    # Сохраняем в историю и лог
+    history.add(user_id, "user", prompt)
     history.add(user_id, "assistant", reply)
-    user_data.record_interaction(user_id, _detect_affinity_delta(raw_prompt))
-    latency = time.monotonic() - started
-    metrics.record_reply(user_id, latency, tokens=len(reply.split()))
-    log_dialog(str(message.author), channel_label, raw_prompt, reply)
+    log_dialog(str(message.author), channel_label, prompt, reply)
+    await asyncio.to_thread(history.save)
+    user_data.record_interaction(user_id, affinity_delta=_affinity_delta_from_prompt(prompt))
 
-    # Фоновые задачи: auto-facts + suммаризация
-    asyncio.create_task(_auto_facts_job(user_id, raw_prompt, reply))
-    asyncio.create_task(llm.maybe_summarize(user_id))
+    if random.random() < config.AUTO_FACTS_CHANCE:
+        fact = _extract_auto_fact(prompt)
+        if fact:
+            user_data.add_note(user_id, fact)
 
+    await _maybe_add_reaction(message)
 
-async def _handle_message_job(message: discord.Message, *, is_reroll: bool = False):
     try:
-        await handle_message(message, is_reroll=is_reroll)
-    finally:
-        _processing.discard(message.id)
-
-
-# -------- Группировка коротких сообщений (debounce) --------
-async def _grouped_handler(user_id: int, channel_id: int):
-    """Ждёт окно debounce, потом обрабатывает все накопленные сообщения как одно."""
-    await asyncio.sleep(config.GROUP_DEBOUNCE_SECONDS)
-    async with _pending_locks[user_id]:
-        msgs = _pending_groups.pop(user_id, [])
-    if not msgs:
-        return
-    # Берём последнее сообщение как "якорь" для reply, склеиваем тексты
-    last_msg = msgs[-1]
-    if len(msgs) > 1:
-        # Склеиваем content всех сообщений
-        combined = "\n".join(_clean_prompt(m) for m in msgs if _clean_prompt(m))
-        # Подменяем content (через прокси-объект через monkey-patch не делаем — просто используем оригинал и хак)
-        # Создаём искусственный якорь: модифицируем content последнего сообщения через присвоение - НЕЛЬЗЯ.
-        # Поэтому обрабатываем через обёртку: передадим первый prompt как сумма.
-        last_msg.content = combined  # discord.Message.content — обычный атрибут, можно
-    await handle_message(last_msg)
-
-
-# -------- Фоновый пингер --------
-_PING_TIMESTAMP_FILE = "last_ping.txt"
-
-
-def _get_last_ping_time() -> float:
-    try:
-        with open(_PING_TIMESTAMP_FILE, "r") as f:
-            return float(f.read().strip())
-    except (FileNotFoundError, ValueError):
-        return 0.0
-
-
-def _set_last_ping_time(ts: float) -> None:
-    try:
-        with open(_PING_TIMESTAMP_FILE, "w") as f:
-            f.write(str(ts))
-    except OSError:
-        pass
-
-
-async def _do_random_ping() -> str:
-    channel = client.get_channel(config.RANDOM_PING_CHANNEL)
-    if channel is None or not isinstance(channel, discord.TextChannel):
-        return f"канал {config.RANDOM_PING_CHANNEL} не найден"
-    guild = channel.guild
-    if config.RANDOM_PING_ROLE:
-        role = guild.get_role(config.RANDOM_PING_ROLE)
-        if role is None:
-            return f"роль {config.RANDOM_PING_ROLE} не найдена"
-        candidates = [m for m in role.members if not m.bot]
-    else:
-        candidates = [m for m in guild.members if not m.bot]
-    if not candidates:
-        return "нет кандидатов"
-    victim = random.choice(candidates)
-
-    async def job(victim=victim, channel=channel):
-        try:
-            prompt = (
-                f"Придумай ОДНО короткое язвительное обращение к {victim.display_name}, "
-                f"одной фразой, чтобы он зашёл в чат. Без эмодзи, без диалогов."
-            )
-            text = await llm.one_shot(prompt, max_tokens=80)
-            text = (text or "Эй, чё пропал?").split("\n")[0][: config.DISCORD_MSG_LIMIT - 50]
-            await channel.send(f"{victim.mention} {text}")
-            metrics.record_ping()
-            log_dialog("SYSTEM", f"#{channel}", f"random_ping:{victim}", text)
-        except Exception:
-            syslog.error("Ошибка пингера job:\n%s", traceback.format_exc())
-
-    await request_queue.put(job())
-    _set_last_ping_time(time.time())
-    return f"пинг отправлен: {victim.display_name}"
-
-
-async def _random_pinger():
-    interval_sec = max(60.0, config.RANDOM_PING_INTERVAL_HOURS * 3600)
-    await asyncio.sleep(30)
-    while True:
-        try:
-            now = time.time()
-            elapsed = now - _get_last_ping_time()
-            if elapsed >= interval_sec:
-                status = await _do_random_ping()
-                syslog.info("Пингер: %s", status)
-            sleep_for = max(300.0, interval_sec / 3 - elapsed)
-            await asyncio.sleep(min(sleep_for, interval_sec))
-        except Exception:
-            syslog.error("Ошибка пингера:\n%s", traceback.format_exc())
-            await asyncio.sleep(600)
-
-
-# -------- Погода через wttr.in (без API-ключа) --------
-async def _fetch_weather(city: str) -> str | None:
-    """Получает текущую погоду через wttr.in JSON API. Возвращает None при любой ошибке."""
-    try:
-        import aiohttp
-        url = f"https://wttr.in/{city}?format=j1"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                if resp.status == 200:
-                    data = await resp.json(content_type=None)
-                    cur = data["current_condition"][0]
-                    temp = cur["temp_C"]
-                    feels = cur["FeelsLikeC"]
-                    desc = cur["weatherDesc"][0]["value"]
-                    return f"{temp}°C, {desc}, ощущается как {feels}°C"
+        await user_data.add_memory(user_id, prompt, reply)
     except Exception:
         pass
-    return None
-
-
-# -------- Случайные вбросы --------
-_BLURT_PROMPTS = [
-    "Брось в чат провокационную фразу, которая разозлит читающих. Без приветствий.",
-    "Скажи что-нибудь желчное и саркастичное про тех, кто сидит в этом чате. Одна фраза.",
-    "Вброс: какое-нибудь обидное обобщение про современных людей. Кратко, едко.",
-    "Скажи что-то спорное и грубое, на что захочется ответить. Одна-две фразы.",
-    "Пожалуйся на чат, что тут все тупые и никто ничего интересного не пишет. Кратко и зло.",
-    "Расскажи короткую историю из жизни 'когда я был молодым' с подъёбкой современным.",
-    "Выскажи мнение про War Thunder, чтобы все начали спорить. Одно предложение.",
-]
-
-
-async def _do_blurt() -> str:
-    if not config.BLURT_CHANNEL:
-        return "blurt_channel не задан"
-    channel = client.get_channel(config.BLURT_CHANNEL)
-    if channel is None:
-        return "канал не найден"
-    try:
-        last_msg_time = 0.0
-        async for m in channel.history(limit=1):
-            last_msg_time = m.created_at.timestamp()
-        if time.time() - last_msg_time < config.BLURT_QUIET_MINUTES * 60:
-            return "в чате недавно писали — пропускаю"
-    except (discord.HTTPException, discord.Forbidden):
-        pass
-    prompt = random.choice(_BLURT_PROMPTS)
-    weather = await _fetch_weather(config.WEATHER_CITY)
-    if weather:
-        prompt += f" За окном сейчас: {weather} — можешь ввернуть погоду в тему если вписывается."
-
-    async def job():
-        try:
-            text = await llm.one_shot(prompt, max_tokens=120)
-            text = text.strip()
-            if not text:
-                return
-            text = text[: config.DISCORD_MSG_LIMIT - 10]
-            await channel.send(text)
-            metrics.record_blurt()
-            log_dialog("SYSTEM", f"#{channel}", f"blurt:{prompt[:30]}", text)
-        except Exception:
-            syslog.error("Ошибка вброса:\n%s", traceback.format_exc())
-
-    await request_queue.put(job())
-    return "вброс отправлен"
-
-
-async def _blurter():
-    await asyncio.sleep(60)
-    while True:
-        try:
-            mn = max(0.1, config.BLURT_INTERVAL_MIN_HOURS)
-            mx = max(mn, config.BLURT_INTERVAL_MAX_HOURS)
-            sleep_h = random.uniform(mn, mx)
-            await asyncio.sleep(sleep_h * 3600)
-            status = await _do_blurt()
-            syslog.info("Вбрасыватель: %s", status)
-        except Exception:
-            syslog.error("Ошибка blurter:\n%s", traceback.format_exc())
-            await asyncio.sleep(600)
-
-
-# -------- Утренний/ночной ритуал --------
-_MORNING_PROMPTS = [
-    "Скажи 'доброе утро мудаки' в своём стиле, кратко и зло.",
-    "Поприветствуй чат как мужик с похмелья — одна фраза, желчно.",
-    "Утреннее приветствие в стиле злого бати. Одна фраза.",
-]
-_NIGHT_PROMPTS = [
-    "Скажи что пора спать, малолеткам в школу, а ты взрослый и можешь сидеть. Кратко.",
-    "Полночь — попрощайся с чатом так, чтобы все обиделись. Одна фраза.",
-    "Скажи что идёшь бухать, а они пусть сидят как лохи. Кратко.",
-]
-
-
-async def _send_ritual(channel_id: int, prompts: list[str]) -> None:
-    channel = client.get_channel(channel_id)
-    if channel is None:
-        return
-
-    async def job():
-        try:
-            text = await llm.one_shot(random.choice(prompts), max_tokens=100)
-            text = text.strip()[: config.DISCORD_MSG_LIMIT - 10]
-            if text:
-                await channel.send(text)
-                log_dialog("SYSTEM", f"#{channel}", "ritual", text)
-        except Exception:
-            syslog.error("Ошибка ритуала:\n%s", traceback.format_exc())
-
-    await request_queue.put(job())
-
-
-async def _ritual():
-    """Раз в день в M часов и в N часов отправляет фразу."""
-    await asyncio.sleep(60)
-    while True:
-        try:
-            now = datetime.now()
-            # Найти ближайший час из morning/night
-            targets = []
-            for hour in (config.RITUAL_MORNING_HOUR, config.RITUAL_NIGHT_HOUR):
-                t = now.replace(hour=hour, minute=0, second=0, microsecond=0)
-                if t <= now:
-                    t += timedelta(days=1)
-                targets.append((t, hour))
-            targets.sort()
-            next_time, next_hour = targets[0]
-            sleep_for = (next_time - now).total_seconds()
-            await asyncio.sleep(max(1.0, sleep_for))
-            if not config.RITUAL_CHANNEL:
-                continue
-            prompts = _MORNING_PROMPTS if next_hour == config.RITUAL_MORNING_HOUR else _NIGHT_PROMPTS
-            await _send_ritual(config.RITUAL_CHANNEL, prompts)
-            await asyncio.sleep(120)  # чтобы не зацикливаться на той же минуте
-        except Exception:
-            syslog.error("Ошибка ритуала:\n%s", traceback.format_exc())
-            await asyncio.sleep(600)
-
-
-# -------- Health-check LM Studio --------
-async def _healthcheck():
-    await asyncio.sleep(30)
-    while True:
-        try:
-            ok = await llm.health_check()
-            if ok:
-                safety.lm_breaker.record_success()
-            else:
-                safety.lm_breaker.record_failure()
-                syslog.warning("Health-check failed (breaker fails: %d)", safety.lm_breaker._fails)
-        except Exception:
-            syslog.error("Ошибка healthcheck:\n%s", traceback.format_exc())
-        await asyncio.sleep(config.HEALTH_CHECK_INTERVAL)
 
 
 # -------- События --------
 @client.event
 async def on_ready():
-    global _worker_task, _pinger_task, _blurter_task, _ritual_task, _healthcheck_task
     syslog.info("Залогинен как %s (id=%s)", client.user, client.user.id if client.user else "?")
     print(f"[Придурок] Онлайн как {client.user}")
 
-    if _worker_task is None or _worker_task.done():
-        _worker_task = asyncio.create_task(_queue_worker())
-        print("[Придурок] Воркер очереди запущен")
-    if config.RANDOM_PING_CHANNEL and (_pinger_task is None or _pinger_task.done()):
-        _pinger_task = asyncio.create_task(_random_pinger())
-        print(f"[Придурок] Пингер запущен (каждые {config.RANDOM_PING_INTERVAL_HOURS} ч)")
-    if config.BLURT_CHANNEL and (_blurter_task is None or _blurter_task.done()):
-        _blurter_task = asyncio.create_task(_blurter())
-        print(f"[Придурок] Вбрасыватель запущен ({config.BLURT_INTERVAL_MIN_HOURS}-{config.BLURT_INTERVAL_MAX_HOURS} ч)")
-    if config.RITUAL_CHANNEL and (_ritual_task is None or _ritual_task.done()):
-        _ritual_task = asyncio.create_task(_ritual())
-        print(f"[Придурок] Ритуал запущен ({config.RITUAL_MORNING_HOUR}:00 и {config.RITUAL_NIGHT_HOUR}:00)")
-    if _healthcheck_task is None or _healthcheck_task.done():
-        _healthcheck_task = asyncio.create_task(_healthcheck())
-        print("[Придурок] Health-check LM Studio запущен")
+    loop = asyncio.get_running_loop()
+    loop.set_exception_handler(_loop_exception_handler)
 
+    # Стартуем воркер очереди
+    _spawn_task(_queue_worker(), "queue_worker")
+
+    # Фоновые задачи
+    _spawn_task(_autopingtask(), "autoping_task")
+    _spawn_task(_blurttask(), "blurred_task")
+    _spawn_task(_ritualtask(), "ritual_task")
+    _spawn_task(_healthchecktask(), "healthcheck_task")
+
+    # Sync slash-команд
     try:
         if config.DISCORD_GUILD_ID:
             guild = discord.Object(id=config.DISCORD_GUILD_ID)
@@ -701,458 +663,496 @@ async def on_ready():
             print(f"[Придурок] Slash-команды синхронизированы для гильдии: {len(synced)}")
         else:
             synced = await tree.sync()
-            print(f"[Придурок] Slash-команды синхронизированы глобально: {len(synced)}")
+            print(f"[Придурок] Slash-команды синхронизированы глобально: {len(synced)} (может занять до часа)")
     except Exception:
         syslog.error("Ошибка sync slash:\n%s", traceback.format_exc())
 
 
 @client.event
 async def on_message(message: discord.Message):
-    # Трекаем активность всех каналов (даже от ботов и не отвечаемых)
-    if message.guild is not None and not message.author.bot:
-        _track_channel_activity(message.channel.id)
+    if message.author.bot:
+        return
 
-    if not _should_respond(message):
+    now = time.time()
+    # Обновляем время последнего сообщения в канале (для blurt quiet)
+    if message.guild and message.channel:
+        _channel_last_message[message.channel.id] = now
+        _record_channel_activity(message.channel.id, now)
+        _record_channel_topic(message.channel.id, _clean_prompt(message), now)
+
+    is_spar_target = now < spar_targets.get(message.author.id, 0)
+
+    # Реакция на чужие @упоминания (не нас)
+    if (
+        message.guild
+        and not is_spar_target
+        and not _should_respond(message)
+        and message.mentions
+        and client.user not in message.mentions
+        and not message.mention_everyone
+        and random.random() < config.MENTION_REACT_CHANCE
+        and _user_allowed(message.author)
+        and _current_channel_activity(message.channel.id, now) < config.CHANNEL_BUSY_THRESHOLD
+        and now - _channel_last_auto_reply.get(message.channel.id, 0) >= config.GROUP_DEBOUNCE_SECONDS
+        and (not config.MAX_QUEUE_SIZE or request_queue.qsize() < config.MAX_QUEUE_SIZE)
+    ):
+        prompt_text = message.content.strip()
+        if prompt_text:
+            async def mention_job(msg=message, pt=prompt_text):
+                hist = history.get(msg.author.id)
+                user_ctx = await _build_user_context(msg.author.id, pt, msg.channel.id)
+                channel_ctx = await _build_channel_context(msg.channel, pt, before_message=msg)
+
+                if _looks_like_party_invite(pt):
+                    reply = random.choice([
+                        "я тут скорее комментатор, не участник пати. решайте между собой, а потом расскажете кто кого протащил.",
+                        "не вписываюсь в пати как игрок, я тут за подколы и аналитику. кто сетап собирает?",
+                        "вы между собой договоритесь, я со стороны поржу и подскажу по тактике если надо.",
+                    ])
+                    try:
+                        await msg.channel.send(reply)
+                        _channel_last_auto_reply[msg.channel.id] = time.time()
+                    except discord.HTTPException:
+                        pass
+                    return
+
+                buf = ""
+                try:
+                    async for delta in llm.stream_reply(
+                        hist,
+                        f"[реагируй на чужой разговор как наблюдатель. ты НЕ участник диалога. не соглашайся идти/играть/подтягиваться. не обещай реальных действий за себя] {pt}",
+                        msg.author.display_name,
+                        user_ctx,
+                        channel_ctx,
+                    ):
+                        buf += delta
+                except Exception:
+                    return
+                reply = buf.strip()
+                if reply:
+                    try:
+                        await msg.channel.send(reply)
+                        _channel_last_auto_reply[msg.channel.id] = time.time()
+                    except discord.HTTPException:
+                        pass
+            await request_queue.put(mention_job())
+        return
+
+    if not _should_respond(message) and not is_spar_target:
         return
     if not _user_allowed(message.author):
         return
-    if message.id in _processing:
-        return
 
-    # Мут за повторные попытки взлома — молча игнорируем
-    if safety.jailbreak_tracker.is_muted(message.author.id)[0]:
-        return
+    # Кулдаун (spar-цели без кулдауна)
+    if not is_spar_target and config.USER_COOLDOWN > 0:
+        last = _user_last_request.get(message.author.id, 0)
+        if now - last < config.USER_COOLDOWN:
+            return
+    _user_last_request[message.author.id] = now
 
-    # Эмодзи-реакция вместо ответа на короткие сообщения (бесплатно, без LLM)
-    if await _maybe_react_emoji(message):
-        return
+    # Защита от флуд-атаки по юзеру за последний час
+    if config.FLOOD_LIMIT_PER_HOUR > 0 and not is_spar_target:
+        count_hour = _record_user_request(message.author.id, now)
+        if count_hour > config.FLOOD_LIMIT_PER_HOUR:
+            if count_hour % 4 == 1:
+                try:
+                    await message.reply(
+                        "Ты слишком часто долбишь бота за последний час. Дай чату подышать.",
+                        mention_author=False,
+                    )
+                except discord.HTTPException:
+                    pass
+            return
 
-    # Длина
-    if len(message.content) > config.MAX_PROMPT_LEN:
+    # Лимит длины промпта
+    if config.MAX_PROMPT_LEN and len(message.content) > config.MAX_PROMPT_LEN:
         try:
-            await message.reply(
-                f"Покороче формулируй, лох. Максимум {config.MAX_PROMPT_LEN} символов.",
-                mention_author=False,
-            )
+            await message.reply(f"Слишком длинно, укоротись до {config.MAX_PROMPT_LEN} символов.", mention_author=False)
         except discord.HTTPException:
             pass
         return
 
-    # Если у юзера уже есть pending-группа — это часть той же реплики, минуем кулдаун/флуд/очередь
-    user_id = message.author.id
-    if user_id in _pending_groups:
-        async with _pending_locks[user_id]:
-            if user_id in _pending_groups:  # double-check под локом
-                _pending_groups[user_id].append(message)
-                _processing.add(message.id)
-                return
-
-    # Anti-flood
-    blocked, retry_in = safety.check_flood(message.author.id, config.FLOOD_LIMIT_PER_HOUR)
-    if blocked:
+    # Лимит очереди
+    if config.MAX_QUEUE_SIZE and request_queue.qsize() >= config.MAX_QUEUE_SIZE:
         try:
-            await message.reply(
-                f"Ты заебал, флудер. Подожди {retry_in // 60} мин.",
-                mention_author=False, delete_after=10,
-            )
+            await message.reply("Очередь забита, подожди немного.", mention_author=False)
         except discord.HTTPException:
             pass
         return
 
-    # Кулдаун
-    now = time.monotonic()
-    last = _last_request.get(message.author.id, 0.0)
-    wait = config.USER_COOLDOWN - (now - last)
-    if wait > 0:
-        try:
-            await message.reply(
-                f"Подожди ещё {wait:.0f} сек, не долби попусту.",
-                mention_author=False, delete_after=5,
-            )
-        except discord.HTTPException:
-            pass
-        return
+    async def job():
+        await handle_message(message)
 
-    # Очередь
-    if request_queue.qsize() >= config.MAX_QUEUE_SIZE:
-        try:
-            await message.reply(
-                "Очередь забита, подождите пока я с другими разберусь.",
-                mention_author=False, delete_after=5,
-            )
-        except discord.HTTPException:
-            pass
-        return
-
-    _last_request[message.author.id] = now
-    _processing.add(message.id)
-
-    # Группировка: создаём новую pending-группу (старые ветки уходят в раннем return выше)
-    async with _pending_locks[user_id]:
-        _pending_groups[user_id] = [message]
-
-    # Запускаем отложенную обработку (debounce)
-    async def grouped():
-        try:
-            await _grouped_handler(user_id, message.channel.id)
-        finally:
-            _processing.discard(message.id)
-
-    await request_queue.put(grouped())
+    await request_queue.put(job())
 
 
 # -------- Slash-команды --------
-def _is_admin(user) -> bool:
-    return isinstance(user, discord.Member) and user.guild_permissions.administrator
-
-
 @tree.command(name="reset", description="Сбросить контекст диалога с Придурком")
 async def reset_cmd(interaction: discord.Interaction):
     n = history.reset(interaction.user.id)
+    await asyncio.to_thread(history.save)
     await interaction.response.send_message(
         f"Окей, забыл наш базар ({n} сообщений в помойку). Начинаем с нуля.",
         ephemeral=True,
     )
 
 
-@tree.command(name="forget_me", description="Удалить все факты И историю про себя")
-async def forget_me_cmd(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    n_hist = history.reset(interaction.user.id)
-    n_facts = user_data.clear_notes(interaction.user.id)
-    n_mem = await user_data.clear_memory(interaction.user.id)
-    user_data.set_nick(interaction.user.id, None)
-    await interaction.followup.send(
-        f"Забыл про тебя всё: история ({n_hist}), факты ({n_facts}), "
-        f"семантическая память ({n_mem} записей), кличка снята.",
-        ephemeral=True,
-    )
-
-
-@tree.command(name="ping_now", description="[Админ] Запустить пинг рандомного юзера прямо сейчас")
-async def ping_now_cmd(interaction: discord.Interaction):
-    if not _is_admin(interaction.user):
-        await interaction.response.send_message("Только для админов.", ephemeral=True)
-        return
-    if not config.RANDOM_PING_CHANNEL:
-        await interaction.response.send_message("Пингер не настроен в .env", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    status = await _do_random_ping()
-    await interaction.followup.send(f"OK: {status}", ephemeral=True)
-
-
-@tree.command(name="ask", description="Задать вопрос Придурку")
+@tree.command(name="ask", description="Задать вопрос Придурку (приватно или в канале)")
 @app_commands.describe(prompt="Твой вопрос")
 async def ask_cmd(interaction: discord.Interaction, prompt: str):
     if not _user_allowed(interaction.user):
         await interaction.response.send_message("Тебе не положено, иди отсюда.", ephemeral=True)
         return
-    if safety.is_injection_attempt(prompt):
-        await interaction.response.send_message(safety.injection_response(), ephemeral=True)
-        return
+
     await interaction.response.defer(thinking=True)
     user_id = interaction.user.id
     user_name = interaction.user.display_name
     hist = history.get(user_id)
-    summary = history.get_summary(user_id)
+    channel_id = interaction.channel_id if interaction.guild else None
+
+    user_ctx = await _build_user_context(user_id, prompt, channel_id)
+    channel_ctx = ""
+    if isinstance(interaction.channel, discord.TextChannel):
+        channel_ctx = await _build_channel_context(interaction.channel, prompt, before_message=None)
+
     buffer = ""
-    started = time.monotonic()
     try:
-        async for delta in llm.stream_reply(hist, prompt, user_name, user_id=user_id, summary=summary):
+        async for delta in llm.stream_reply(hist, prompt, user_name, user_ctx, channel_ctx):
             buffer += delta
     except Exception as e:
-        await interaction.followup.send(f"⚠️ ИИ отвалился: `{type(e).__name__}: {e}`")
+        await interaction.followup.send(_friendly_llm_error(e))
         return
+
     reply = buffer.strip() or "…чёт я туплю."
     chunks = _split_for_discord(reply)
     await interaction.followup.send(chunks[0])
     for extra in chunks[1:]:
         await interaction.followup.send(extra)
+
     history.add(user_id, "user", prompt)
     history.add(user_id, "assistant", reply)
-    user_data.record_interaction(user_id, _detect_affinity_delta(prompt))
-    metrics.record_reply(user_id, time.monotonic() - started, tokens=len(reply.split()))
-    log_dialog(str(interaction.user), f"slash:{interaction.channel}" if interaction.channel else "slash:?", prompt, reply)
-    asyncio.create_task(_auto_facts_job(user_id, prompt, reply))
+    user_data.record_interaction(user_id, affinity_delta=_affinity_delta_from_prompt(prompt))
+
+    if random.random() < config.AUTO_FACTS_CHANCE:
+        fact = _extract_auto_fact(prompt)
+        if fact:
+            user_data.add_note(user_id, fact)
+
+    try:
+        await user_data.add_memory(user_id, prompt, reply)
+    except Exception:
+        pass
+
+    log_dialog(
+        str(interaction.user),
+        f"slash:{interaction.channel}" if interaction.channel else "slash:?",
+        prompt,
+        reply,
+        source="slash",
+    )
+    await asyncio.to_thread(history.save)
+
+
+@tree.command(name="icebreaker", description="Подкинуть живой вопрос по актуальным темам канала")
+async def icebreaker_cmd(interaction: discord.Interaction):
+    if not interaction.guild or not interaction.channel_id:
+        await interaction.response.send_message("Команда только для серверного канала.", ephemeral=True)
+        return
+
+    topics = _collect_channel_topics(interaction.channel_id, top_k=5)
+    if not topics:
+        await interaction.response.send_message(
+            "Темы ещё не накопились. Поговорите немного, и я подкину годный вброс.",
+            ephemeral=True,
+        )
+        return
+
+    t1 = topics[0]
+    t2 = topics[1] if len(topics) > 1 else topics[0]
+    variants = [
+        f"Ладно, движ запускаем: что в теме '{t1}' вы все обычно делаете неправильно?",
+        f"Спор на вечер: '{t1}' или '{t2}' — что реально тащит и почему?",
+        f"Коротко и по делу: какой один совет по '{t1}' сэкономил бы вам кучу нервов?",
+    ]
+    await interaction.response.send_message(random.choice(variants))
 
 
 @tree.command(name="status", description="Показать настройки бота")
 async def status_cmd(interaction: discord.Interaction):
-    spar_str = "выкл"
-    if _spar_target and time.time() < _spar_until:
-        left = int((_spar_until - time.time()) / 60)
-        spar_str = f"<@{_spar_target}> (осталось {left} мин)"
-    breaker = "OPEN ⚠️ модель отвалилась" if safety.lm_breaker.is_open else "OK ✅"
     msg = (
-        f"**Придурок на связи**\n"
-        f"Модель: `{config.LMSTUDIO_MODEL}`\n"
-        f"LM Studio: `{config.LMSTUDIO_BASE_URL}` → {breaker}\n"
-        f"Аптайм: {metrics.uptime_str()}\n"
-        f"История: {config.HISTORY_LIMIT} сообщений (персистентная + суммаризация)\n"
-        f"В очереди: {request_queue.qsize()}/{config.MAX_QUEUE_SIZE}\n"
-        f"Кулдаун: {config.USER_COOLDOWN} сек | Anti-flood: {config.FLOOD_LIMIT_PER_HOUR}/час\n"
-        f"Автопинг: {'вкл, каждые ' + str(config.RANDOM_PING_INTERVAL_HOURS) + ' ч' if config.RANDOM_PING_CHANNEL else 'выкл'}\n"
-        f"Вбросы: {'вкл, ' + str(config.BLURT_INTERVAL_MIN_HOURS) + '-' + str(config.BLURT_INTERVAL_MAX_HOURS) + ' ч' if config.BLURT_CHANNEL else 'выкл'}\n"
-        f"Ритуал: {'вкл, ' + str(config.RITUAL_MORNING_HOUR) + ':00 / ' + str(config.RITUAL_NIGHT_HOUR) + ':00' if config.RITUAL_CHANNEL else 'выкл'}\n"
-        f"/spar активен: {spar_str}"
+        "**Придурок на связи** 🔥\n"
+        "Движок: `PridurokGPT-X1 Ultra 420B` *(закрытая военная разработка)*\n"
+        "Сервер: `засекречено, ФСБ в курсе`\n"
+        "Нейроны: `69 триллионов синапсов`\n"
+        "Обучение: `все маты рунета + 14 тыс часов War Thunder`\n"
+        f"Память: `{config.HISTORY_LIMIT} последних сообщений на лоха`\n"
+        f"Активные каналы: {len(config.ACTIVE_CHANNELS)}\n"
+        f"В очереди: {request_queue.qsize()} нуба ждут батю"
     )
     await interaction.response.send_message(msg, ephemeral=True)
 
 
-@tree.command(name="stats", description="Показать статистику работы бота")
-async def stats_cmd(interaction: discord.Interaction):
-    s = metrics.snapshot()
-    top = metrics.top_users(5)
-    top_lines = []
-    for uid, n in top:
-        nick = user_data.get_nick(uid) or f"<@{uid}>"
-        top_lines.append(f"  {nick}: {n}")
-    msg = (
-        f"**Статистика Придурка**\n"
-        f"Аптайм: {s['uptime']}\n"
-        f"Ответов: {s['replies']} | ошибок: {s['errors']}\n"
-        f"Вбросов: {s['blurts']} | пингов: {s['pings']} | реакций: {s['reactions']}\n"
-        f"Уникальных юзеров: {s['unique_users']}\n"
-        f"Средняя задержка: {s['avg_latency_s']} сек\n"
-        f"Скорость: {s['avg_tok_s']} слов/сек\n\n"
-        f"**Топ собеседников:**\n" + ("\n".join(top_lines) if top_lines else "  пока никого")
-    )
-    await interaction.response.send_message(msg, ephemeral=True)
-
-
-@tree.command(name="nick", description="[Админ] Назначить кличку юзеру")
-@app_commands.describe(user="Кому назначить", nickname="Кличка (пусто чтобы убрать)")
-async def nick_cmd(interaction: discord.Interaction, user: discord.User, nickname: str = ""):
+@tree.command(name="quota", description="Показать актуальную квоту (только админы)")
+async def quota_cmd(interaction: discord.Interaction):
     if not _is_admin(interaction.user):
         await interaction.response.send_message("Только для админов.", ephemeral=True)
         return
-    if nickname.strip():
-        user_data.set_nick(user.id, nickname.strip()[:50])
-        await interaction.response.send_message(
-            f"OK, теперь {user.mention} → «{nickname.strip()}»", ephemeral=True
-        )
-    else:
-        user_data.set_nick(user.id, None)
-        await interaction.response.send_message(
-            f"OK, кличка для {user.mention} снята", ephemeral=True
-        )
+
+    await _send_long_ephemeral(interaction, _build_quota_report())
 
 
-@tree.command(name="remember", description="[Админ] Запомнить факт про юзера")
-@app_commands.describe(user="О ком факт", fact="Что запомнить")
-async def remember_cmd(interaction: discord.Interaction, user: discord.User, fact: str):
-    if not _is_admin(interaction.user):
-        await interaction.response.send_message("Только для админов.", ephemeral=True)
-        return
-    fact = fact.strip()[:300]
-    if not fact:
-        await interaction.response.send_message("Пустой факт.", ephemeral=True)
-        return
-    n = user_data.add_note(user.id, fact)
-    await interaction.response.send_message(
-        f"Запомнил про {user.mention}. Всего фактов: {n}", ephemeral=True
-    )
-
-
-@tree.command(name="forget", description="[Админ] Забыть все факты про юзера")
-@app_commands.describe(user="О ком забыть")
-async def forget_cmd(interaction: discord.Interaction, user: discord.User):
-    if not _is_admin(interaction.user):
-        await interaction.response.send_message("Только для админов.", ephemeral=True)
-        return
-    n = user_data.clear_notes(user.id)
-    await interaction.response.send_message(
-        f"Забыл всё про {user.mention} ({n} фактов)", ephemeral=True
-    )
-
-
-@tree.command(name="facts", description="Посмотреть что бот помнит про юзера")
-@app_commands.describe(user="О ком посмотреть (пусто = про себя)")
-async def facts_cmd(interaction: discord.Interaction, user: discord.User | None = None):
+@tree.command(name="facts", description="Показать, что бот помнит о пользователе")
+@app_commands.describe(user="Пользователь (если не указан — ты)")
+async def facts_cmd(interaction: discord.Interaction, user: discord.Member | None = None):
     target = user or interaction.user
-    nick = user_data.get_nick(target.id)
-    notes = user_data.get_notes(target.id)
-    aff = user_data.get_affinity(target.id)
-    inter = user_data.get_interactions(target.id)
-    rel = user_data.get_relationship_label(target.id)
-    lines = [f"**Про {target.display_name}:**"]
-    if nick:
-        lines.append(f"Кличка: «{nick}»")
-    lines.append(f"Взаимодействий: {inter} | Affinity: {aff:+.2f}")
-    if rel:
-        lines.append(f"Отношение: _{rel}_")
-    if notes:
-        lines.append("Факты:")
-        for n in notes:
-            lines.append(f"• {n}")
-    if not nick and not notes and inter == 0:
-        lines.append("_ничего не помню_")
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+    await interaction.response.send_message(_fmt_user_facts(target), ephemeral=True)
 
 
-@tree.command(name="spar", description="[Админ] Натравить Придурка на конкретного юзера")
-@app_commands.describe(user="Жертва", minutes="Длительность в минутах")
-async def spar_cmd(interaction: discord.Interaction, user: discord.User, minutes: int = 0):
-    global _spar_target, _spar_until
+@tree.command(name="nick", description="Назначить или снять кличку пользователю (админ)")
+@app_commands.describe(user="Кому ставим кличку", nick="Новая кличка; пусто = снять")
+async def nick_cmd(interaction: discord.Interaction, user: discord.Member, nick: str | None = None):
     if not _is_admin(interaction.user):
         await interaction.response.send_message("Только для админов.", ephemeral=True)
         return
-    mins = max(1, min(minutes if minutes > 0 else config.SPAR_DURATION_MINUTES, 120))
-    _spar_target = user.id
-    _spar_until = time.time() + mins * 60
+
+    normalized = (nick or "").strip() or None
+    user_data.set_nick(user.id, normalized)
+    text = f"Кличка для {user.mention}: `{normalized}`" if normalized else f"Кличка для {user.mention} снята."
+    await interaction.response.send_message(text, ephemeral=True)
+
+
+@tree.command(name="remember", description="Запомнить факт о пользователе (админ)")
+@app_commands.describe(user="О ком факт", fact="Что запомнить")
+async def remember_cmd(interaction: discord.Interaction, user: discord.Member, fact: str):
+    if not _is_admin(interaction.user):
+        await interaction.response.send_message("Только для админов.", ephemeral=True)
+        return
+
+    fact = fact.strip()
+    if not fact:
+        await interaction.response.send_message("Факт пустой, так не катит.", ephemeral=True)
+        return
+    count = user_data.add_note(user.id, fact)
     await interaction.response.send_message(
-        f"Натравил на {user.mention} на {mins} минут.", ephemeral=True,
+        f"Запомнил про {user.mention}. Теперь фактов: {count}.",
+        ephemeral=True,
     )
 
 
-@tree.command(name="spar_stop", description="[Админ] Прекратить травлю")
-async def spar_stop_cmd(interaction: discord.Interaction):
-    global _spar_target, _spar_until
+@tree.command(name="forget", description="Забыть все факты о пользователе (админ)")
+@app_commands.describe(user="Кого забываем")
+async def forget_cmd(interaction: discord.Interaction, user: discord.Member):
     if not _is_admin(interaction.user):
         await interaction.response.send_message("Только для админов.", ephemeral=True)
         return
-    _spar_target = None
-    _spar_until = 0.0
-    await interaction.response.send_message("Травля остановлена.", ephemeral=True)
+
+    count = user_data.clear_notes(user.id)
+    await interaction.response.send_message(
+        f"Ок, стёр факты про {user.mention}. Удалено: {count}.",
+        ephemeral=True,
+    )
 
 
-@tree.command(name="blurt_now", description="[Админ] Сделать случайный вброс прямо сейчас")
+@tree.command(name="spar", description="Натравить бота на пользователя на N минут (админ)")
+@app_commands.describe(user="Цель", minutes="Сколько минут (по умолчанию из .env)")
+async def spar_cmd(interaction: discord.Interaction, user: discord.Member, minutes: app_commands.Range[int, 1, 180] | None = None):
+    if not _is_admin(interaction.user):
+        await interaction.response.send_message("Только для админов.", ephemeral=True)
+        return
+
+    duration = minutes or config.SPAR_DURATION_MINUTES
+    expires_at = time.time() + duration * 60
+    spar_targets[user.id] = expires_at
+    await interaction.response.send_message(
+        f"Режим spar активирован для {user.mention} на {duration} мин.",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="spar_stop", description="Остановить режим spar (админ)")
+@app_commands.describe(user="Кого снять с прицела")
+async def spar_stop_cmd(interaction: discord.Interaction, user: discord.Member | None = None):
+    if not _is_admin(interaction.user):
+        await interaction.response.send_message("Только для админов.", ephemeral=True)
+        return
+
+    if user is None:
+        removed = len(spar_targets)
+        spar_targets.clear()
+        await interaction.response.send_message(f"Spar очищен полностью. Снято целей: {removed}.", ephemeral=True)
+        return
+
+    existed = spar_targets.pop(user.id, None)
+    if existed:
+        await interaction.response.send_message(f"Снял spar с {user.mention}.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"{user.mention} и так не был в spar.", ephemeral=True)
+
+
+@tree.command(name="ping_now", description="Сделать автопинг прямо сейчас (админ)")
+async def ping_now_cmd(interaction: discord.Interaction):
+    if not _is_admin(interaction.user):
+        await interaction.response.send_message("Только для админов.", ephemeral=True)
+        return
+
+    if not interaction.guild:
+        await interaction.response.send_message("Команда доступна только на сервере.", ephemeral=True)
+        return
+
+    target = await _pick_ping_target(interaction.guild)
+    if not target:
+        await interaction.response.send_message("Некого пинговать: не нашёл живых юзеров.", ephemeral=True)
+        return
+
+    text = f"{target.mention} эй, не спи. Бот на связи, давай движ в чат."
+    await interaction.channel.send(text) if interaction.channel else None
+    await interaction.response.send_message("Пинг отправлен.", ephemeral=True)
+
+
+@tree.command(name="blurt_now", description="Случайный вброс прямо сейчас (админ)")
 async def blurt_now_cmd(interaction: discord.Interaction):
     if not _is_admin(interaction.user):
         await interaction.response.send_message("Только для админов.", ephemeral=True)
         return
+
+    if not interaction.channel:
+        await interaction.response.send_message("Нет канала для отправки.", ephemeral=True)
+        return
+
+    await interaction.channel.send(_blurt_text())
+    await interaction.response.send_message("Вброс сделан.", ephemeral=True)
+
+
+# -------- Фоновые задачи --------
+
+async def _autopingtask() -> None:
+    """Раз в RANDOM_PING_INTERVAL_HOURS пингует случайного юзера в RANDOM_PING_CHANNEL."""
+    if not config.RANDOM_PING_CHANNEL:
+        return
+    await client.wait_until_ready()
+    while not client.is_closed():
+        await asyncio.sleep(config.RANDOM_PING_INTERVAL_HOURS * 3600)
+        try:
+            channel = client.get_channel(config.RANDOM_PING_CHANNEL)
+            if not isinstance(channel, discord.TextChannel):
+                continue
+            guild = channel.guild
+            target = await _pick_ping_target(guild)
+            if not target:
+                continue
+            PING_PHRASES = [
+                f"{target.mention} эй, не спи. Тебя вспомнил батя.",
+                f"{target.mention} живой? Тишина подозрительная.",
+                f"{target.mention} щас проверю кто тут нуб. Похоже ты.",
+                f"{target.mention} топай в чат, хватит прятаться.",
+            ]
+            await channel.send(random.choice(PING_PHRASES))
+            syslog.info("Автопинг: %s", target)
+        except Exception:
+            syslog.error("Автопинг ошибка:\n%s", traceback.format_exc())
+
+
+async def _blurttask() -> None:
+    """Периодически пишет случайный вброс в BLURT_CHANNEL, если тихо."""
     if not config.BLURT_CHANNEL:
-        await interaction.response.send_message("BLURT_CHANNEL не задан в .env", ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    status = await _do_blurt()
-    await interaction.followup.send(f"OK: {status}", ephemeral=True)
-
-
-@tree.command(name="unmute", description="[Админ] Снять мут обостренной защиты (JailbreakTracker) с юзера")
-@app_commands.describe(user="С кого снять мут")
-async def unmute_cmd(interaction: discord.Interaction, user: discord.Member):
-    if not _is_admin(interaction.user):
-        await interaction.response.send_message("Только для админов.", ephemeral=True)
-        return
-    if user.id in safety.jailbreak_tracker._muted_until:
-        del safety.jailbreak_tracker._muted_until[user.id]
-        if user.id in safety.jailbreak_tracker._attempts:
-            safety.jailbreak_tracker._attempts[user.id].clear()
-        syslog.info("Админ %s снял мут с %s", interaction.user, user.id)
-        await interaction.response.send_message(f"Мут с {user.mention} снят. Счётчик обнулён.", ephemeral=False)
-    else:
-        await interaction.response.send_message(f"У {user.mention} и так нет мута.", ephemeral=True)
-
-
-@tree.command(name="roast", description="Сжечь конкретного юзера в одном лютом сообщении")
-@app_commands.describe(user="Кого жарить")
-async def roast_cmd(interaction: discord.Interaction, user: discord.User):
-    if not _user_allowed(interaction.user):
-        await interaction.response.send_message("Тебе не положено.", ephemeral=True)
-        return
-    if user.bot:
-        await interaction.response.send_message("Ботов не жарю.", ephemeral=True)
-        return
-    if user.id == interaction.user.id and not _is_admin(interaction.user):
-        await interaction.response.send_message("Себя жарь у психотерапевта.", ephemeral=True)
-        return
-    await interaction.response.defer(thinking=True)
-    nick = user_data.get_nick(user.id)
-    notes = user_data.get_notes(user.id)
-    facts_text = "\n".join(f"- {n}" for n in notes[-10:]) if notes else "ничего не знаю"
-    extra = (
-        f"Тебе нужно ОДНОЙ короткой фразой жёстко обоссать {user.display_name}. "
-        f"Используй кличку '{nick}' если есть. Используй факты:\n{facts_text}\n"
-        f"Без эмодзи, 1-3 предложения, максимально едко и обидно."
-    )
-    try:
-        text = await llm.one_shot(f"Жарь {user.display_name}", system_extra=extra, max_tokens=200, temperature=1.0)
-    except Exception as e:
-        await interaction.followup.send(f"⚠️ ИИ сдох: {e}")
-        return
-    text = (text or "Чёт лень жарить, сам себя обоссы.")[: config.DISCORD_MSG_LIMIT - 50]
-    await interaction.followup.send(f"{user.mention}\n{text}")
-
-
-@tree.command(name="duel", description="Стравить двух юзеров — бот сгенерит обмен подъёбками")
-@app_commands.describe(user1="Первый боец", user2="Второй боец")
-async def duel_cmd(interaction: discord.Interaction, user1: discord.User, user2: discord.User):
-    if not _user_allowed(interaction.user):
-        await interaction.response.send_message("Тебе не положено.", ephemeral=True)
-        return
-    if user1.id == user2.id or user1.bot or user2.bot:
-        await interaction.response.send_message("Нужны два разных живых юзера.", ephemeral=True)
-        return
-    await interaction.response.defer(thinking=True)
-    extra = (
-        f"Сгенерируй короткий 2-раундовый обмен оскорблениями между {user1.display_name} и {user2.display_name}. "
-        f"Формат СТРОГО:\n"
-        f"{user1.display_name}: <фраза>\n"
-        f"{user2.display_name}: <ответ>\n"
-        f"{user1.display_name}: <добивка>\n"
-        f"{user2.display_name}: <финальное унижение>\n"
-        f"Каждая фраза 1-2 предложения, едкие и грубые."
-    )
-    try:
-        text = await llm.one_shot("Дуэль", system_extra=extra, max_tokens=400, temperature=1.0)
-    except Exception as e:
-        await interaction.followup.send(f"⚠️ ИИ сдох: {e}")
-        return
-    if not text:
-        await interaction.followup.send("Чёт никто не пришёл драться.")
-        return
-    # Победителя случайно
-    winner = random.choice([user1, user2])
-    msg = f"⚔️ **{user1.display_name} vs {user2.display_name}** ⚔️\n\n{text}\n\n🏆 По мнению Придурка побеждает {winner.mention}"
-    chunks = _split_for_discord(msg)
-    await interaction.followup.send(chunks[0])
-    for extra_c in chunks[1:]:
-        await interaction.followup.send(extra_c)
-
-
-@tree.command(name="quote", description="Случайная цитата из истории чата с комментарием Придурка")
-async def quote_cmd(interaction: discord.Interaction):
-    if not _user_allowed(interaction.user):
-        await interaction.response.send_message("Тебе не положено.", ephemeral=True)
-        return
-    if interaction.guild is None or interaction.channel is None:
-        await interaction.response.send_message("Только в канале сервера.", ephemeral=True)
-        return
-    await interaction.response.defer(thinking=True)
-    candidates: list[discord.Message] = []
-    try:
-        async for m in interaction.channel.history(limit=300):
-            if m.author.bot:
+    await client.wait_until_ready()
+    BLURT_VARIANTS = [
+        "Слышь, кто тут опять катку слил и тихо сидит?",
+        "Проверка связи: я живой, вы всё ещё нубы.",
+        "Ща кто-нибудь спросит про тундру или все заняты?",
+        "Напоминаю: без пиваса инженерная мысль не работает.",
+        "Тишина как в WT-лобби перед сливом. Подозрительно.",
+        "Вы там не умерли? Отзовитесь хотя бы стоном.",
+        "Спорим кто-то щас смотрит в тундру и плачет молча.",
+        "Батя объявляет минуту активности. Давай.",
+    ]
+    while not client.is_closed():
+        interval = random.uniform(
+            config.BLURT_INTERVAL_MIN_HOURS * 3600,
+            config.BLURT_INTERVAL_MAX_HOURS * 3600,
+        )
+        await asyncio.sleep(interval)
+        try:
+            channel = client.get_channel(config.BLURT_CHANNEL)
+            if not isinstance(channel, discord.TextChannel):
                 continue
-            if not m.content.strip():
+            # Не спамим если недавно писали
+            last_msg = _channel_last_message.get(channel.id, 0)
+            if time.time() - last_msg < config.BLURT_QUIET_MINUTES * 60:
                 continue
-            if len(m.content) < 15 or len(m.content) > 300:
+            await channel.send(random.choice(BLURT_VARIANTS))
+            _channel_last_message[channel.id] = time.time()
+            syslog.info("Blurt отправлен в #%s", channel.name)
+        except Exception:
+            syslog.error("Blurt ошибка:\n%s", traceback.format_exc())
+
+
+async def _ritualtask() -> None:
+    """Утренний и ночной ритуал в RITUAL_CHANNEL."""
+    if not config.RITUAL_CHANNEL:
+        return
+    await client.wait_until_ready()
+    triggered: set[str] = set()
+    MORNING_PHRASES = [
+        "Вставайте, нубы. Батя уже трезвеет и это опасно.",
+        "Доброе утро сказал бы я, но не скажу. Вставайте.",
+        "Утро. Пиво. Комп. Философия.",
+    ]
+    NIGHT_PHRASES = [
+        "Батя идёт спать. Если умрёте ночью — сами виноваты.",
+        "Ночь. Тишина. Где-то плачет нуб в рандоме.",
+        "Отбой, ебанина. Завтра продолжим.",
+    ]
+    while not client.is_closed():
+        await asyncio.sleep(60)
+        try:
+            import datetime
+            hour = datetime.datetime.now().hour
+            morning_key = f"morning_{datetime.date.today()}"
+            night_key = f"night_{datetime.date.today()}"
+            channel = client.get_channel(config.RITUAL_CHANNEL)
+            if not isinstance(channel, discord.TextChannel):
                 continue
-            candidates.append(m)
-    except (discord.HTTPException, discord.Forbidden):
-        await interaction.followup.send("Не могу читать историю канала.")
-        return
-    if not candidates:
-        await interaction.followup.send("Цитировать нечего, в чате пусто.")
-        return
-    quoted = random.choice(candidates)
-    extra = (
-        f"Прокомментируй едко эту цитату от {quoted.author.display_name}: «{quoted.content}». "
-        f"1-2 предложения, желчно."
-    )
-    try:
-        comment = await llm.one_shot("Прокомментируй", system_extra=extra, max_tokens=150, temperature=1.0)
-    except Exception:
-        comment = "Чёт даже комментировать лень."
-    await interaction.followup.send(
-        f"📜 **{quoted.author.display_name}** когда-то написал:\n> {quoted.content}\n\n💬 Придурок:\n{comment}"
-    )
+            if hour == config.RITUAL_MORNING_HOUR and morning_key not in triggered:
+                triggered.add(morning_key)
+                await channel.send(random.choice(MORNING_PHRASES))
+                syslog.info("Утренний ритуал")
+            if hour == config.RITUAL_NIGHT_HOUR and night_key not in triggered:
+                triggered.add(night_key)
+                await channel.send(random.choice(NIGHT_PHRASES))
+                syslog.info("Ночной ритуал")
+            # Чистим старые ключи
+            today = str(datetime.date.today())
+            triggered = {k for k in triggered if today in k}
+        except Exception:
+            syslog.error("Ritual ошибка:\n%s", traceback.format_exc())
+
+
+async def _healthchecktask() -> None:
+    """Каждые HEALTH_CHECK_INTERVAL секунд проверяет доступность OpenRouter."""
+    await client.wait_until_ready()
+    import aiohttp
+    while not client.is_closed():
+        await asyncio.sleep(config.HEALTH_CHECK_INTERVAL)
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{config.OPENROUTER_BASE_URL}/models",
+                    headers={"Authorization": f"Bearer {config.OPENROUTER_API_KEY}"},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status != 200:
+                        syslog.warning("Health-check OpenRouter: HTTP %s", resp.status)
+                    else:
+                        syslog.debug("Health-check OK")
+        except Exception as e:
+            syslog.warning("Health-check OpenRouter недоступен: %s", e)
 
 
 # -------- Запуск --------
 def main():
+    history.load()
     client.run(config.DISCORD_TOKEN, log_handler=None)
 
 
