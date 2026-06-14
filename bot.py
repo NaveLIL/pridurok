@@ -3,10 +3,12 @@ import asyncio
 import collections
 import datetime
 import email.utils
+import json
 import random
 import re
 import time
 import traceback
+from pathlib import Path
 
 import discord
 from discord import app_commands
@@ -15,7 +17,9 @@ import chronicle
 import config
 import history
 import llm
+import safety
 import user_data
+import search_engine
 from dialog_logger import log_dialog, system as syslog
 
 
@@ -520,13 +524,25 @@ async def _send_long_ephemeral(interaction: discord.Interaction, text: str) -> N
 def _fmt_user_facts(user: discord.abc.User) -> str:
     nick = user_data.get_nick(user.id)
     notes = user_data.get_notes(user.id)
-    parts: list[str] = [f"Пользователь: {user.mention} (`{user.id}`)"]
-    parts.append(f"Кличка: {nick if nick else 'не задана'}")
+    affinity = user_data.get_affinity(user.id)
+    interactions = user_data.get_interactions(user.id)
+    relationship = user_data.get_relationship_label(user.id) or "пока не определено (мало общались)"
+    
+    # Получаем лимиты генерации
+    _, remaining_draws = user_data.check_image_limit(user.id, max_per_day=config.IMAGE_GEN_LIMIT_PER_DAY)
+
+    parts: list[str] = [f"**Профиль пользователя {user.mention}**"]
+    parts.append(f"• **Кличка**: {nick if nick else 'не задана'}")
+    parts.append(f"• **Общение**: {interactions} реплик")
+    parts.append(f"• **Отношение**: {relationship} (очки: `{affinity:+.2f}`)")
+    parts.append(f"• **Лимит картинок (/draw)**: {remaining_draws} из {config.IMAGE_GEN_LIMIT_PER_DAY} попыток осталось на сегодня")
+    
     if notes:
-        lines = "\n".join(f"- {n}" for n in notes)
-        parts.append(f"Факты ({len(notes)}):\n{lines}")
+        lines = "\n".join(f"  - {n}" for n in notes)
+        parts.append(f"• **Факты в памяти ({len(notes)}):\n{lines}**")
     else:
-        parts.append("Факты: пусто")
+        parts.append("• **Факты в памяти**: пусто")
+        
     return "\n".join(parts)
 
 
@@ -561,15 +577,47 @@ async def handle_message(message: discord.Message):
     if not prompt:
         return
 
-    now = time.time()
     user_id = message.author.id
-    user_name = message.author.display_name
     channel_label = (
         f"#{message.channel}" if message.guild else f"DM:{message.author}"
     )
     channel_id = message.channel.id if message.guild else None
 
+    # Проверка на мут за джейлбрейк
+    is_muted, rem_secs = safety.jailbreak_tracker.is_muted(user_id)
+    if is_muted:
+        return
+
+    # Проверка на попытку джейлбрейка
+    if safety.is_injection_attempt(prompt):
+        is_admin = _is_admin(message.author)
+        safety.jailbreak_tracker.record(user_id, is_admin=is_admin)
+        reply = safety.jailbreak_tracker.escalated_response(user_id)
+        try:
+            await message.reply(reply, mention_author=False)
+        except discord.HTTPException:
+            pass
+        log_dialog(
+            user=str(message.author),
+            channel=channel_label,
+            prompt=f"[INJECTION BLOCKED] {prompt}",
+            reply=reply,
+            source="injection_blocked",
+            user_id=user_id,
+            channel_id=channel_id,
+        )
+        return
+
+    now = time.time()
+    user_name = message.author.display_name
     hist = history.get(user_id)
+
+    # Извлекаем картинки из вложений
+    image_urls = []
+    if message.attachments:
+        for att in message.attachments:
+            if att.content_type and att.content_type.startswith("image/"):
+                image_urls.append(att.url)
 
     # Контексты пользователя и канала
     user_ctx = await _build_user_context(user_id, prompt, channel_id)
@@ -588,7 +636,7 @@ async def handle_message(message: discord.Message):
 
     async with message.channel.typing():
         try:
-            async for delta in llm.stream_reply(hist, prompt, user_name, user_ctx, channel_ctx):
+            async for delta in llm.stream_reply(hist, prompt, user_name, user_ctx, channel_ctx, image_urls, user_id=user_id):
                 buffer += delta
                 now = time.monotonic()
                 if now - last_edit >= edit_interval and buffer.strip():
@@ -604,6 +652,11 @@ async def handle_message(message: discord.Message):
             return
 
     reply = buffer.strip() or "…чёт я туплю, повтори."
+
+    # Детектор сломанной роли
+    if safety.is_broken_role(reply):
+        syslog.warning("Сорвался с роли в ответе для %s: '%s'", message.author.display_name, reply)
+        reply = safety.broken_role_response()
 
     # Финальный вывод с разбиением
     chunks = _split_for_discord(reply)
@@ -649,6 +702,11 @@ async def handle_message(message: discord.Message):
 async def on_ready():
     syslog.info("Залогинен как %s (id=%s)", client.user, client.user.id if client.user else "?")
     print(f"[Придурок] Онлайн как {client.user}")
+    
+    try:
+        await search_engine.init_db()
+    except Exception as e:
+        syslog.error("Ошибка инициализации базы данных поиска: %s", e)
 
     loop = asyncio.get_running_loop()
     loop.set_exception_handler(_loop_exception_handler)
@@ -662,6 +720,7 @@ async def on_ready():
     _spawn_task(_ritualtask(), "ritual_task")
     _spawn_task(_chronicletask(), "chronicle_task")
     _spawn_task(_healthchecktask(), "healthcheck_task")
+    _spawn_task(_giveaway_monitor_task(), "giveaway_monitor_task")
 
     # Sync slash-команд
     try:
@@ -733,6 +792,7 @@ async def on_message(message: discord.Message):
                         msg.author.display_name,
                         user_ctx,
                         channel_ctx,
+                        user_id=msg.author.id,
                     ):
                         buf += delta
                 except Exception:
@@ -813,8 +873,29 @@ async def ask_cmd(interaction: discord.Interaction, prompt: str):
         await interaction.response.send_message("Тебе не положено, иди отсюда.", ephemeral=True)
         return
 
-    await interaction.response.defer(thinking=True)
     user_id = interaction.user.id
+    is_muted, rem = safety.jailbreak_tracker.is_muted(user_id)
+    if is_muted:
+        await interaction.response.send_message(f"Ты забанен за попытки взлома. Осталось: {rem} сек.", ephemeral=True)
+        return
+
+    if safety.is_injection_attempt(prompt):
+        is_admin = _is_admin(interaction.user)
+        safety.jailbreak_tracker.record(user_id, is_admin=is_admin)
+        reply = safety.jailbreak_tracker.escalated_response(user_id)
+        await interaction.response.send_message(reply, ephemeral=True)
+        log_dialog(
+            user=str(interaction.user),
+            channel=f"slash:{interaction.channel}" if interaction.channel else "slash:?",
+            prompt=f"[INJECTION BLOCKED] {prompt}",
+            reply=reply,
+            source="injection_blocked",
+            user_id=user_id,
+            channel_id=interaction.channel_id,
+        )
+        return
+
+    await interaction.response.defer(thinking=True)
     user_name = interaction.user.display_name
     hist = history.get(user_id)
     channel_id = interaction.channel_id if interaction.guild else None
@@ -826,13 +907,17 @@ async def ask_cmd(interaction: discord.Interaction, prompt: str):
 
     buffer = ""
     try:
-        async for delta in llm.stream_reply(hist, prompt, user_name, user_ctx, channel_ctx):
+        async for delta in llm.stream_reply(hist, prompt, user_name, user_ctx, channel_ctx, user_id=user_id):
             buffer += delta
     except Exception as e:
         await interaction.followup.send(_friendly_llm_error(e))
         return
 
     reply = buffer.strip() or "…чёт я туплю."
+    if safety.is_broken_role(reply):
+        syslog.warning("Сорвался с роли в ответе для %s в /ask: '%s'", interaction.user.display_name, reply)
+        reply = safety.broken_role_response()
+
     chunks = _split_for_discord(reply)
     await interaction.followup.send(chunks[0])
     for extra in chunks[1:]:
@@ -927,7 +1012,7 @@ async def quota_cmd(interaction: discord.Interaction):
     await _send_long_ephemeral(interaction, _build_quota_report())
 
 
-@tree.command(name="facts", description="Показать, что бот помнит о пользователе")
+@tree.command(name="facts", description="Показать профиль пользователя и то, что Придурок о нем помнит")
 @app_commands.describe(user="Пользователь (если не указан — ты)")
 async def facts_cmd(interaction: discord.Interaction, user: discord.Member | None = None):
     target = user or interaction.user
@@ -1038,7 +1123,7 @@ async def ping_now_cmd(interaction: discord.Interaction):
 @tree.command(name="blurt_now", description="Случайный вброс прямо сейчас (админ)")
 async def blurt_now_cmd(interaction: discord.Interaction):
     if not _is_admin(interaction.user):
-        await interaction.response.send_message("Только для админов.", ephemeral=True)
+        await interaction.response.send_message("Только для adminov.", ephemeral=True)
         return
 
     if not interaction.channel:
@@ -1047,6 +1132,65 @@ async def blurt_now_cmd(interaction: discord.Interaction):
 
     await interaction.channel.send(_blurt_text())
     await interaction.response.send_message("Вброс сделан.", ephemeral=True)
+
+
+@tree.command(name="draw", description="Сгенерировать картинку по промпту (лимит: 5 в день)")
+@app_commands.describe(prompt="Промпт для генерации картинки")
+async def draw_cmd(interaction: discord.Interaction, prompt: str):
+    if not _user_allowed(interaction.user):
+        await interaction.response.send_message("Тебе не положено, иди отсюда.", ephemeral=True)
+        return
+
+    user_id = interaction.user.id
+    allowed, remaining = user_data.check_image_limit(user_id, max_per_day=config.IMAGE_GEN_LIMIT_PER_DAY)
+    if not allowed:
+        await interaction.response.send_message(f"Слышь, не наглей. Лимит — {config.IMAGE_GEN_LIMIT_PER_DAY} картинок в день. Приходи завтра.", ephemeral=True)
+        return
+
+    await interaction.response.defer(thinking=True)
+    try:
+        img_url = await llm.generate_image(prompt)
+        if not img_url:
+            await interaction.followup.send("Чё-то сломалось при проявке плёнки (пустой ответ). Попробуй позже.")
+            return
+
+        import io
+        import base64
+        import aiohttp
+
+        if img_url.startswith("data:image"):
+            header, base64_data = img_url.split(",", 1)
+            ext = "png"
+            if "jpeg" in header or "jpg" in header:
+                ext = "jpg"
+            elif "webp" in header:
+                ext = "webp"
+            file_bytes = base64.b64decode(base64_data)
+            discord_file = discord.File(io.BytesIO(file_bytes), filename=f"image.{ext}")
+            await interaction.followup.send(file=discord_file)
+            user_data.increment_image_count(user_id)
+            return
+
+        if img_url.startswith("http"):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(img_url) as resp:
+                        if resp.status == 200:
+                            data = await resp.read()
+                            discord_file = discord.File(io.BytesIO(data), filename="image.png")
+                            await interaction.followup.send(file=discord_file)
+                            user_data.increment_image_count(user_id)
+                            return
+            except Exception:
+                pass
+            await interaction.followup.send(img_url)
+            user_data.increment_image_count(user_id)
+            return
+
+        await interaction.followup.send("Чё-то прислали странное вместо картинки. Не разберу.")
+    except Exception as e:
+        syslog.error("Ошибка в /draw:\n%s", traceback.format_exc())
+        await interaction.followup.send("Слышь, не вышло картинку сделать. Че-то там заклинило на серваке.")
 
 
 # -------- Фоновые задачи --------
@@ -1114,12 +1258,33 @@ async def _blurttask() -> None:
             syslog.error("Blurt ошибка:\n%s", traceback.format_exc())
 
 
+RITUAL_STATE_FILE = Path(__file__).parent / "logs" / "ritual_state.json"
+
+
+def _load_ritual_state() -> dict[str, str]:
+    if not RITUAL_STATE_FILE.exists():
+        return {}
+    try:
+        with open(RITUAL_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_ritual_state(state: dict[str, str]) -> None:
+    try:
+        RITUAL_STATE_FILE.parent.mkdir(exist_ok=True)
+        with open(RITUAL_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
 async def _ritualtask() -> None:
     """Утренний и ночной ритуал в RITUAL_CHANNEL."""
     if not config.RITUAL_CHANNEL:
         return
     await client.wait_until_ready()
-    triggered: set[str] = set()
     MORNING_PHRASES = [
         "Вставайте, нубы. Батя уже трезвеет и это опасно.",
         "Доброе утро сказал бы я, но не скажу. Вставайте.",
@@ -1134,23 +1299,33 @@ async def _ritualtask() -> None:
         await asyncio.sleep(60)
         try:
             import datetime
-            hour = datetime.datetime.now().hour
-            morning_key = f"morning_{datetime.date.today()}"
-            night_key = f"night_{datetime.date.today()}"
+            now_dt = datetime.datetime.now()
+            hour = now_dt.hour
+            today_str = str(datetime.date.today())
+
+            state = _load_ritual_state()
+            last_morning = state.get("last_morning")
+            last_night = state.get("last_night")
+
             channel = client.get_channel(config.RITUAL_CHANNEL)
             if not isinstance(channel, discord.TextChannel):
                 continue
-            if hour == config.RITUAL_MORNING_HOUR and morning_key not in triggered:
-                triggered.add(morning_key)
+
+            updated = False
+            if hour == config.RITUAL_MORNING_HOUR and last_morning != today_str:
+                state["last_morning"] = today_str
+                updated = True
                 await channel.send(random.choice(MORNING_PHRASES))
-                syslog.info("Утренний ритуал")
-            if hour == config.RITUAL_NIGHT_HOUR and night_key not in triggered:
-                triggered.add(night_key)
+                syslog.info("Утренний ритуал отправлен")
+
+            if hour == config.RITUAL_NIGHT_HOUR and last_night != today_str:
+                state["last_night"] = today_str
+                updated = True
                 await channel.send(random.choice(NIGHT_PHRASES))
-                syslog.info("Ночной ритуал")
-            # Чистим старые ключи
-            today = str(datetime.date.today())
-            triggered = {k for k in triggered if today in k}
+                syslog.info("Ночной ритуал отправлен")
+
+            if updated:
+                _save_ritual_state(state)
         except Exception:
             syslog.error("Ritual ошибка:\n%s", traceback.format_exc())
 
@@ -1203,6 +1378,25 @@ async def _healthchecktask() -> None:
                         syslog.debug("Health-check OK")
         except Exception as e:
             syslog.warning("Health-check OpenRouter недоступен: %s", e)
+
+
+async def _giveaway_monitor_task() -> None:
+    """Периодически проверяет раздачи и новости и публикует их."""
+    import monitor
+    syslog.info("Запущен фоновый мониторинг раздач и новостей.")
+    # При запуске даем боту немного времени на полную инициализацию
+    await asyncio.sleep(15)
+    
+    while not client.is_closed():
+        try:
+            syslog.info("Запуск фоновой проверки новостей и раздач...")
+            await monitor.process_and_post_updates(client)
+        except Exception as e:
+            syslog.error("Ошибка в фоновом мониторе новостей: %s", e, exc_info=True)
+            
+        interval_seconds = config.NEWS_CHECK_INTERVAL_HOURS * 3600
+        # Спим заданный интервал (минимум 10 минут во избежание спама при сбоях)
+        await asyncio.sleep(max(600.0, interval_seconds))
 
 
 # -------- Запуск --------

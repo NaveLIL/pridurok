@@ -29,6 +29,12 @@ OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/ap
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 OPENROUTER_ALLOW_EMPTY_API_KEY = os.getenv("OPENROUTER_ALLOW_EMPTY_API_KEY", "0").strip().lower() in ("1", "true", "yes")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "google/gemini-2.5-flash").strip()
+OPENROUTER_IMAGE_MODEL = os.getenv("OPENROUTER_IMAGE_MODEL", "black-forest-labs/flux.2-klein-4b").strip()
+OPENROUTER_TRANSLATE_MODEL = os.getenv("OPENROUTER_TRANSLATE_MODEL", "mistralai/ministral-14b-2512").strip()
+IMAGE_GEN_LIMIT_PER_DAY = int(os.getenv("IMAGE_GEN_LIMIT_PER_DAY", "5"))
+GIPHY_API_KEY = os.getenv("GIPHY_API_KEY", "").strip()
+GIVEAWAY_CHANNEL_ID = int(os.getenv("GIVEAWAY_CHANNEL_ID") or 1390391884245106758)
+NEWS_CHECK_INTERVAL_HOURS = float(os.getenv("NEWS_CHECK_INTERVAL_HOURS", "4"))
 OPENROUTER_FALLBACK_MODELS: list[str] = _parse_csv(os.getenv("OPENROUTER_FALLBACK_MODELS", ""))
 
 ACTIVE_CHANNELS: set[int] = _parse_ids(os.getenv("ACTIVE_CHANNELS", ""))

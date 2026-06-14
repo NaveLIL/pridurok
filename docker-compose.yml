@@ -1,0 +1,21 @@
+version: "3.8"
+
+services:
+  pridurok:
+    build: .
+    env_file: .env
+    restart: unless-stopped
+    volumes:
+      - ./logs:/app/logs
+      - ./memory_db:/app/memory_db
+      - ./history.json:/app/history.json
+      - ./user_data.json:/app/user_data.json
+      - ./last_ping.txt:/app/last_ping.txt
+      # Исходники — монтируем чтобы docker restart подхватывал изменения без rebuild
+      - ./bot.py:/app/bot.py
+      - ./llm.py:/app/llm.py
+      - ./tools.py:/app/tools.py
+      - ./config.py:/app/config.py
+      - ./persona.py:/app/persona.py
+      - ./safety.py:/app/safety.py
+      - ./monitor.py:/app/monitor.py

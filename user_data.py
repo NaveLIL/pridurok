@@ -227,6 +227,35 @@ def get_relationship_label(user_id: int) -> str | None:
     return None
 
 
+def check_image_limit(user_id: int, max_per_day: int = 5) -> tuple[bool, int]:
+    """Проверяет лимит генерации картинок на сегодня. Возвращает (разрешено?, осталось попыток)."""
+    import datetime
+    today = str(datetime.date.today())
+    with _lock:
+        e = _get_entry(user_id)
+        if e.get("image_gen_date") != today:
+            e["image_gen_date"] = today
+            e["image_gen_count"] = 0
+            _save()
+        count = e.get("image_gen_count", 0)
+        if count >= max_per_day:
+            return False, 0
+        return True, max_per_day - count
+
+
+def increment_image_count(user_id: int) -> None:
+    """Увеличивает счетчик генераций картинок пользователя на сегодня."""
+    import datetime
+    today = str(datetime.date.today())
+    with _lock:
+        e = _get_entry(user_id)
+        if e.get("image_gen_date") != today:
+            e["image_gen_date"] = today
+            e["image_gen_count"] = 0
+        e["image_gen_count"] = e.get("image_gen_count", 0) + 1
+        _save()
+
+
 def all_users() -> dict[str, dict]:
     with _lock:
         return dict(_data)
