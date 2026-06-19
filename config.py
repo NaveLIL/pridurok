@@ -40,6 +40,7 @@ OPENROUTER_FALLBACK_MODELS: list[str] = _parse_csv(os.getenv("OPENROUTER_FALLBAC
 ACTIVE_CHANNELS: set[int] = _parse_ids(os.getenv("ACTIVE_CHANNELS", ""))
 ALLOWED_ROLES: set[int] = _parse_ids(os.getenv("ALLOWED_ROLES", ""))
 ADMIN_ROLES: set[int] = _parse_ids(os.getenv("ADMIN_ROLES", ""))
+IMAGE_GEN_ROLES: set[int] = _parse_ids(os.getenv("IMAGE_GEN_ROLES", ""))
 
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "20"))
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "600"))

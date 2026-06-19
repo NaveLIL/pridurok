@@ -124,6 +124,18 @@ def _is_admin(member: discord.abc.User) -> bool:
     return False
 
 
+def _member_has_any_role(member: discord.abc.User, role_ids: set[int]) -> bool:
+    if not isinstance(member, discord.Member) or not role_ids:
+        return False
+    return any(r.id in role_ids for r in member.roles)
+
+
+def _draw_allowed(member: discord.abc.User) -> bool:
+    if config.IMAGE_GEN_ROLES:
+        return _member_has_any_role(member, config.IMAGE_GEN_ROLES)
+    return _user_allowed(member)
+
+
 def _should_respond(message: discord.Message) -> bool:
     if message.author.bot:
         return False
@@ -131,9 +143,6 @@ def _should_respond(message: discord.Message) -> bool:
         return False
     # DM
     if message.guild is None:
-        return True
-    # Активный канал — отвечаем на всё
-    if message.channel.id in config.ACTIVE_CHANNELS:
         return True
     # Упоминание бота
     if client.user and client.user.mentioned_in(message) and not message.mention_everyone:
@@ -715,8 +724,8 @@ async def on_ready():
     _spawn_task(_queue_worker(), "queue_worker")
 
     # Фоновые задачи
-    _spawn_task(_autopingtask(), "autoping_task")
-    _spawn_task(_blurttask(), "blurred_task")
+    # _spawn_task(_autopingtask(), "autoping_task")  # Отключено: спам в чате
+    # _spawn_task(_blurttask(), "blurred_task")      # Отключено: спам в чате
     _spawn_task(_ritualtask(), "ritual_task")
     _spawn_task(_chronicletask(), "chronicle_task")
     _spawn_task(_healthchecktask(), "healthcheck_task")
@@ -1137,8 +1146,11 @@ async def blurt_now_cmd(interaction: discord.Interaction):
 @tree.command(name="draw", description="Сгенерировать картинку по промпту (лимит: 5 в день)")
 @app_commands.describe(prompt="Промпт для генерации картинки")
 async def draw_cmd(interaction: discord.Interaction, prompt: str):
-    if not _user_allowed(interaction.user):
-        await interaction.response.send_message("Тебе не положено, иди отсюда.", ephemeral=True)
+    if not _draw_allowed(interaction.user):
+        await interaction.response.send_message(
+            "Эта команда доступна только пользователям с разрешённой ролью.",
+            ephemeral=True,
+        )
         return
 
     user_id = interaction.user.id
